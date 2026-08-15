@@ -23,6 +23,28 @@ const { execFileSync } = require("child_process");
 try { require("dotenv").config(); } catch {}
 try { require("dotenv").config({ path: path.resolve(__dirname, ".env") }); } catch {}
 
+// 内置极简 .env 解析（零依赖）：未安装 dotenv 时也能读取脚本同目录的 .env
+function loadLocalEnv() {
+  try {
+    const envPath = path.join(__dirname, ".env");
+    if (!fs.existsSync(envPath)) return;
+    const lines = fs.readFileSync(envPath, "utf8").split(/\r?\n/);
+    for (const line of lines) {
+      const t = line.trim();
+      if (!t || t.startsWith("#")) continue;
+      const eq = t.indexOf("=");
+      if (eq < 0) continue;
+      const k = t.slice(0, eq).trim();
+      let v = t.slice(eq + 1).trim();
+      if (v.length >= 2 && ((v.startsWith('"') && v.endsWith('"')) || (v.startsWith("'") && v.endsWith("'")))) {
+        v = v.slice(1, -1);
+      }
+      if (!(k in process.env)) process.env[k] = v;
+    }
+  } catch {}
+}
+loadLocalEnv();
+
 const BASE_URL = process.env.DASHSCOPE_BASE_URL || "https://dashscope.aliyuncs.com/compatible-mode/v1";
 const API_KEY = process.env.DASHSCOPE_API_KEY || "sk-xxx";
 const MODEL = process.env.VISION_MODEL || "xxx";
