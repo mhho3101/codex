@@ -1,0 +1,4 @@
+interface:
+  display_name: "Seedance 2.5 OS"
+  short_description: "把普通想法直接变成可用的 Seedance 2.5 视频提示词"
+  default_prompt: "Use $seedance-25 to turn my idea into a paste-ready Seedance 2.5 prompt."

@@ -1,0 +1,49 @@
+schema_version: "2.1"
+project_id: "replace-me"
+title: "Untitled video"
+run_shape: "talking-head-roundtrip"
+agent_adapter:
+  product: "unknown"
+  execution_mode: "capability-detected"
+goal: ""
+audience: ""
+platform: "douyin"
+format:
+  ratio: "9:16"
+  width: 1080
+  height: 1920
+  fps: 30
+  target_duration_seconds: null
+source_strategy:
+  a_roll: []
+  b_roll: []
+  script: null
+  shared_proxy: null
+content_contract:
+  keep_all_sentences: false
+  protected_sentences: []
+  glossary_file: "glossary.json"
+visual_direction:
+  reference_assets: []
+  selected_direction: null
+editing:
+  intensity: "conservative"
+  pause_policy: "compress-long-preserve-breath"
+generation:
+  seedance_choice: null
+  choices: ["A-chatcut-seedance-high-quality", "B-volcengine-ark-high-quality", "C-no-seedance"]
+  execution_channel: null
+  model_contract:
+    requested_model: "seedance2"
+    resolved_model: null
+    resolution: "1080p"
+    allow_mini_for_final: false
+  direct_api:
+    key_environment_variable: "ARK_API_KEY"
+    key_configured: false
+  approval_mode: "per-job"
+  budget_ceiling: null
+deliverable:
+  editable_timelines: true
+  final_export_after_approval: true
+assumptions: []
