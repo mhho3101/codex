@@ -2,7 +2,7 @@
 
 将你的 Codex 自定义技能托管在 GitHub 上，实现多设备同步。
 
-## 包含的技能（22 个）
+## 包含的技能（29 个）
 
 | 技能 | 说明 |
 |------|------|
@@ -28,6 +28,13 @@
 | tmeet | 腾讯会议 CLI（tmeet）：OAuth 授权登录/登出/状态查询、会议管理（创建/更新/取消/查询/受邀者）、录制管理（列表/播放地址/智能纪要/转写/录制权限申请）、会议报告（参会人/等候室/导出参会成员明细/异步... |
 | tmeet-skill | 腾讯会议 CLI（tmeet）：OAuth 授权登录/登出/状态查询、会议管理（创建/更新/取消/查询/受邀者）、录制管理（列表/播放地址/智能纪要/转写/录制权限申请）、会议报告（参会人/等候室/导出参会成员明细/异步... |
 | video-production | 端到端视频制作工作流——需求梳理、脚本/分镜、素材准备、剪辑、音频、字幕与导出。用户要求制作任何视频时使用本技能。 |
+| slide-maker | 制作、重做和审查演示文稿：先确认受众和目标，再完成叙事、设计和 PPTX 产出。 |
+| ppt-design-skill | 基于 pptx-designer 生成、审查和修订可编辑 PowerPoint，包含 brief 到 PNG 视觉验收流程。 |
+| gpt-image2-ppt | 使用 gpt-image-2 和多种视觉风格生成整页高分辨率幻灯片，并打包为 16:9 PPTX。 |
+| academic-pptx | 面向会议报告、组会、论文答辩和基金汇报的学术演示内容与论证结构。 |
+| consulting-pptx-skill | 经营管理与咨询风格幻灯片：约 80 条版式规则、62 种 HTML 版式部件，输出 HTML 和 PDF。 |
+| autocad-automation | AutoCAD 自动化：DWG/DXF 绘图、图层、文字、块、标注、批处理、SCR/AutoLISP/.NET 辅助。 |
+| solidworks-automation | SolidWorks CAD 自动化：零件、孔槽、装配、工程图、导出和交付复核，能力以 capabilities.yaml 为准。 |
 
 ## 安装方法
 
