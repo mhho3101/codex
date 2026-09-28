@@ -2,10 +2,13 @@
 
 将你的 Codex 自定义技能托管在 GitHub 上，实现多设备同步。
 
-## 包含的技能（30 个）
+## 包含的技能（32 个）
 
 | 技能 | 说明 |
 |------|------|
+| anysearch-skill | AnySearch 实时搜索——通用网页搜索、垂直领域搜索、并行批量搜索、整页正文提取。Agent 需要联网检索事实、抓取网页内容时使用。 |
+| cangjie-skill | 仓颉——把书、长视频/播客/课程的方法论蒸馏成可执行的原子 Skills。用户说“拆书”“蒸馏这本书”“把这个视频做成 skill”时使用。 |
+| chatcut | ChatCut 官方 Codex 插件包——通过 MCP 操作 ChatCut 视频项目：素材导入、时间线剪辑、动效、数字人、转写、字幕、导出等（内含 17 个子技能，见下方说明）。 |
 | agent-video-pipeline | Build, resume, and quality-control a cross-agent, editable video pipeline using ChatCut for source ingestion, ... |
 | chatcut-plugin-basics | Use for video editing or video creation work that should be editable in ChatCut, even when the user does not e... |
 | claude-vision | 让无法原生识图的模型获得图片识别能力。当用户分享本地或网络图片路径、消息中出现图片附件、或要求分析/描述/识别图片内容时使用。通过调用阿里云百炼(DashScope)的视觉模型API，将图片转为base64并发送给视觉模... |
@@ -105,4 +108,25 @@ claude-vision-skill 需要 .env 配置（已在 .gitignore 中排除）。
 参考 `skills/claude-vision-skill/.env.example` 创建自己的配置，**不要提交真实密钥到仓库**。
 
 
+
+
+## 上游来源
+
+`anysearch-skill`、`cangjie-skill`、`chatcut` 三个技能为上游仓库的完整同步，版权与许可归原作者所有，各自目录内保留了原始 `LICENSE`：
+
+| 目录 | 上游仓库 |
+|------|----------|
+| `skills/cangjie-skill` | [kangarooking/cangjie-skill](https://github.com/kangarooking/cangjie-skill) |
+| `skills/anysearch-skill` | [anysearch-ai/anysearch-skill](https://github.com/anysearch-ai/anysearch-skill) |
+| `skills/chatcut` | [ChatCut-Inc/agent-plugin](https://github.com/ChatCut-Inc/agent-plugin)（`codex/` 包） |
+
+### chatcut 插件包说明
+
+`skills/chatcut` 是 ChatCut 官方 Codex 插件包，根目录**没有** `SKILL.md`（它是插件而非单一技能），因此不能整体安装。它的 17 个子技能位于 `skills/chatcut/skills/` 下，按需逐个安装：
+
+```
+install-skill-from-github.py --repo mhho3101/codex --path skills/chatcut/skills/export
+```
+
+可用子技能：`asset-import`、`chatcut-plugin-basics`、`create-motion-graphics`、`digital-human`、`export`、`known-errors`、`multicam-sync`、`music`、`product-help`、`shader-gen`、`talking-head-guide`、`transcription`、`verification`、`video-gen`、`video-translation`、`voice`、`widget-forms`。
 
