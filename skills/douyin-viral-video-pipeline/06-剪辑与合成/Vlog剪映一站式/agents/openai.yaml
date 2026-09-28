@@ -1,0 +1,7 @@
+interface:
+  display_name: "Vlog L3 V3 自动剪辑与配乐"
+  short_description: "自然语言规划拍摄，用剪映智能字幕、事实时间和音乐节拍完成自动剪辑"
+  default_prompt: "使用 $vlog-jianying-one-stop 把我的想法或现有素材整理成连续 Vlog，优先用剪映智能字幕生成可编辑人物对白，按人物原声区间完成配乐，克制使用轻网感特效，并以电视关机＋彩色‘晚安’结束卡收尾后导出。"
+
+policy:
+  allow_implicit_invocation: true

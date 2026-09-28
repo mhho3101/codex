@@ -1,0 +1,46 @@
+# ===== 生成产物(每条视频的项目目录,不进仓库)=====
+output/
+*.mp4
+*.png
+*.jpg
+*.jpeg
+*.webp
+*.xlsx
+!docs/**/*.png
+!assets/**/*.png
+
+# ===== 密钥与本地配置(绝不提交)=====
+.ai-video-sannong/
+config.json
+.env
+.env.*
+*.key
+
+# ===== Claude Code 本地设置(个人权限,不开源)=====
+.claude/
+
+# ===== Python =====
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+.venv/
+venv/
+env/
+.pytest_cache/
+
+# ===== 打包产物 =====
+*.skill
+*.zip
+
+# ===== 操作系统 / 编辑器 =====
+.DS_Store
+.DS_Store?
+._*
+.Spotlight-V100
+.Trashes
+Thumbs.db
+.vscode/
+.idea/
+*.swp
+*~

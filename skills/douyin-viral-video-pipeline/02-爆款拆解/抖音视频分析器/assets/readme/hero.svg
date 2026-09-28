@@ -1,0 +1,14 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1200" height="400" viewBox="0 0 1200 400" role="img" aria-labelledby="t d">
+  <title id="t">抖音转写</title>
+  <desc id="d">抖音视频分析 Skill：分享链接进，文字稿和摘要出，不靠付费解析 API。</desc>
+  <defs><clipPath id="c"><rect width="1200" height="400" rx="26"/></clipPath></defs>
+  <g clip-path="url(#c)">
+    <rect width="1200" height="400" fill="#1a0a10"/>
+    <text x="56" y="64" fill="#be8c96" font-size="16" font-family="Segoe UI, sans-serif">AGENT SKILL  ·  NO PAID PARSER</text>
+    <rect x="56" y="76" width="56" height="6" rx="3" fill="#fe2c55"/>
+    <text x="56" y="160" fill="#ffe8ee" font-size="52" font-weight="700" font-family="Microsoft YaHei, Segoe UI, sans-serif">抖音转写</text>
+    <rect x="56" y="178" width="220" height="10" rx="5" fill="#ffb4be"/>
+    <text x="56" y="230" fill="#ffe8ee" font-size="20" font-family="Microsoft YaHei, sans-serif">链接进，文字稿和摘要出。</text>
+    <text x="56" y="348" fill="#be8c96" font-size="14" font-family="Consolas, monospace">PLAYWRIGHT  ·  WHISPER  ·  OFFLINE</text>
+  </g>
+</svg>

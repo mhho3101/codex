@@ -1,0 +1,52 @@
+{
+  "_说明": "示例不是可直接执行的电影方案。替换原片和输出路径、片头结束秒、片尾开始秒及选段；示例为三段各20秒，共60秒。相对路径按本配置文件所在目录解析。",
+  "movie_name": "电影名（如：天坑鹰猎）",
+  "src": "原片视频文件路径",
+  "out_dir": "输出目录路径（片段将写到此目录下）",
+  "ffmpeg": "ffmpeg",
+  "ffprobe": "ffprobe",
+  "segments": [
+    {
+      "num": 1,
+      "title": "人物遇到难题后的选择",
+      "clips": [
+        [
+          20,
+          40
+        ],
+        [
+          60,
+          80
+        ],
+        [
+          100,
+          120
+        ]
+      ],
+      "narrations": [
+        {
+          "text": "根据真实剧情填写旁白，不复述对白",
+          "clip": 1,
+          "after_sec": 4
+        }
+      ]
+    }
+  ],
+  "_字段说明": {
+    "segments[].num": "从1开始的序号",
+    "segments[].title": "副标题，有网感，可做封面吸引点击",
+    "segments[].clips": "原片的片段列表，每个元素 [起始秒, 结束秒]，可跨时间挑片段",
+    "segments[].narrations[].text": "旁白文案，有意义能引到剧情或解释剧情",
+    "segments[].narrations[].clip": "该旁白出现在第几个片段（从1开始）",
+    "segments[].narrations[].after_sec": "在该片段内的第几秒出现",
+    "_剪辑规则参考": "references/style_guide.md",
+    "head_end": "确认后的片头结束秒；没有片头填0",
+    "tail_start": "确认后的片尾开始秒；没有片尾填原片时长",
+    "min_duration": "成片最短秒数，默认50",
+    "max_duration": "成片最长秒数，默认75"
+  },
+  "head_end": 10,
+  "tail_start": 200,
+  "min_duration": 50,
+  "max_duration": 75
+}

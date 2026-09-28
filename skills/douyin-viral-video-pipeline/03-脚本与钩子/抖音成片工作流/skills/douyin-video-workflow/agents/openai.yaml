@@ -1,0 +1,4 @@
+interface:
+  display_name: "讲解短视频工作流"
+  short_description: "用 ChatCut 时间线、HyperFrames 逐词动效和同步音效制作严格验收的讲解视频"
+  default_prompt: "Use $douyin-video-workflow to turn this link, manuscript, topic, or existing cut into a strict ChatCut and HyperFrames narrated-video project."

@@ -1,0 +1,4 @@
+interface:
+  display_name: "千川素材·短视频获客脚本"
+  short_description: "基于元麻烦理论与卖点可视化，产出可直接拍摄的80秒获客视频脚本"
+  default_prompt: "帮我写一个 [产品] 的千川获客脚本"

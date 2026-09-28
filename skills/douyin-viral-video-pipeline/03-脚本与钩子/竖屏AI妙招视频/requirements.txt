@@ -1,0 +1,10 @@
+# ai-video-creator skill —— Python 依赖
+# 安装:pip install -r requirements.txt
+#
+# 注意:视频拼接与抽帧还需要系统级 ffmpeg(不在 pip 里):
+#   macOS:        brew install ffmpeg
+#   Ubuntu/Debian: sudo apt install ffmpeg
+#   Windows:      https://www.gyan.dev/ffmpeg/builds/  (把 bin 加进 PATH)
+
+requests>=2.28.0     # 火山 ARK API 调用
+openpyxl>=3.1.0      # 生成 storyboard.xlsx 分镜表

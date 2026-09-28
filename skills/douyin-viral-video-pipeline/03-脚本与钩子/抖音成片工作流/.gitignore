@@ -1,0 +1,13 @@
+.DS_Store
+.env
+.env.*
+!.env.example
+projects/
+verify/
+*.mp4
+*.mov
+*.wav
+*.mp3
+*.m4a
+*.srt
+*.log

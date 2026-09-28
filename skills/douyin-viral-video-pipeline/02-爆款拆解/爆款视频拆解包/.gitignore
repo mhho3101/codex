@@ -1,0 +1,33 @@
+# Generated packages
+source.mp4
+keyframes/
+speaker_transcript.md
+story_analysis.md
+_work/
+
+# Private local setup
+references/local-setup.private.md
+*.cookies.txt
+cookies.txt
+*cookies*.txt
+
+# Python
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.venv/
+venv/
+
+# Model and cache folders
+.cache/
+models/
+model-cache/
+manual-models/
+
+# OS/editor noise
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/

@@ -1,0 +1,220 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "Lianhuanhua Project",
+  "type": "object",
+  "required": [
+    "version",
+    "mode",
+    "video",
+    "paths"
+  ],
+  "properties": {
+    "version": {
+      "type": "string"
+    },
+    "mode": {
+      "enum": [
+        "text",
+        "audio",
+        "video"
+      ]
+    },
+    "mood": {
+      "type": "string"
+    },
+    "video": {
+      "type": "object",
+      "required": [
+        "width",
+        "height",
+        "fps"
+      ],
+      "properties": {
+        "width": {
+          "type": "integer",
+          "minimum": 320
+        },
+        "height": {
+          "type": "integer",
+          "minimum": 320
+        },
+        "fps": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 120
+        },
+        "subtitle_font": {
+          "type": "string"
+        },
+        "burn_subtitles": {
+          "type": "boolean"
+        }
+      },
+      "additionalProperties": false
+    },
+    "paths": {
+      "type": "object",
+      "required": [
+        "story",
+        "character_images",
+        "media"
+      ],
+      "properties": {
+        "story": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "character_images": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "media": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "background_music": {
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "additionalProperties": false
+    },
+    "visual": {
+      "type": "object",
+      "properties": {
+        "style_prompt": {
+          "type": "string"
+        },
+        "character_identity_hint": {
+          "type": "string"
+        },
+        "reference_mode": {
+          "enum": [
+            "image",
+            "style",
+            "image_or_style"
+          ]
+        }
+      },
+      "additionalProperties": false
+    },
+    "storyboard": {
+      "type": "object",
+      "properties": {
+        "image_density": {
+          "enum": [
+            "smart",
+            "one_per_sentence",
+            "three_sentences"
+          ],
+          "default": "smart"
+        },
+        "variation_strength": {
+          "enum": [
+            "克制",
+            "标准",
+            "明显",
+            "强烈"
+          ],
+          "default": "明显"
+        }
+      },
+      "additionalProperties": false
+    },
+    "tts": {
+      "type": "object",
+      "properties": {
+        "speaker": {
+          "type": "string"
+        },
+        "voice_preference": {
+          "type": "string"
+        },
+        "voice_profile": {
+          "type": "string"
+        },
+        "model": {
+          "enum": [
+            "seed-tts-2.0-standard",
+            "seed-tts-2.0-expressive"
+          ]
+        },
+        "format": {
+          "enum": [
+            "mp3",
+            "ogg_opus",
+            "pcm"
+          ]
+        },
+        "sample_rate": {
+          "type": "integer"
+        },
+        "bit_rate": {
+          "type": "integer"
+        },
+        "speech_rate": {
+          "type": "number",
+          "minimum": -50,
+          "maximum": 100
+        },
+        "loudness_rate": {
+          "type": "number",
+          "minimum": -50,
+          "maximum": 100
+        },
+        "emotion": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "emotion_scale": {
+          "type": "number",
+          "minimum": 1,
+          "maximum": 5
+        }
+      },
+      "additionalProperties": false
+    },
+    "image_workflow": {
+      "type": "object",
+      "properties": {
+        "mode": {
+          "enum": [
+            "ask",
+            "external",
+            "codex",
+            "hybrid"
+          ],
+          "default": "ask"
+        },
+        "review": {
+          "enum": [
+            "none",
+            "manual",
+            "strict"
+          ],
+          "default": "none"
+        },
+        "repair": {
+          "enum": [
+            "ask",
+            "prompt-only",
+            "codex"
+          ],
+          "default": "ask"
+        }
+      },
+      "additionalProperties": false
+    }
+  },
+  "additionalProperties": false
+}

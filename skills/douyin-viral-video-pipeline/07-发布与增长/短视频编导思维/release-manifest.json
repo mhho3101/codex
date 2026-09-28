@@ -1,0 +1,26 @@
+{
+  "version": "0.3.8",
+  "coreSkills": [
+    "bifang"
+  ],
+  "allPublicSkills": [
+    "bifang",
+    "bifang-starter",
+    "bifang-topic",
+    "bifang-script",
+    "bifang-review",
+    "bifang-rewrite",
+    "bifang-feedback",
+    "bifang-intake",
+    "bifang-diagnosis",
+    "bifang-profile",
+    "bifang-assets",
+    "bifang-report",
+    "bifang-baokuan",
+    "bifang-baokuan-batch",
+    "bifang-clip",
+    "bifang-account-plan",
+    "bifang-evidence"
+  ],
+  "excludedPathSegments": [".git", "internal", "private", "archive"]
+}

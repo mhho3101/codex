@@ -1,0 +1,21 @@
+# Python
+__pycache__/
+*.pyc
+.env
+
+.superpowers/
+
+work/
+docs/
+/tests/
+skills/video-add-graphic-motion/tests/
+
+.claude/worktrees/
+.worktree/
+.vscode/
+# HyperFrames preview cache + regenerable self-check stills/gallery
+.hyperframes/
+# snapshots/
+# gallery.html
+
+video-add-graphic-motion_bak/

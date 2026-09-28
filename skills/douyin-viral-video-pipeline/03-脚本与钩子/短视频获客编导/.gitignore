@@ -1,0 +1,6 @@
+# 客户数据是用户私有，永远不进仓库
+clients/
+# 引擎运行产物
+__pycache__/
+*.pyc
+.DS_Store

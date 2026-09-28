@@ -1,0 +1,41 @@
+# Normalize line endings for cross-platform contributors.
+# See https://docs.github.com/en/get-started/getting-started-with-git/configuring-git-to-handle-line-endings
+
+# Default: LF in repo, OS-native on checkout
+* text=auto eol=lf
+
+# Python: keep LF
+*.py        text eol=lf
+*.pyi       text eol=lf
+
+# Shell / config: keep LF
+*.sh        text eol=lf
+*.bash      text eol=lf
+*.toml      text eol=lf
+*.yml       text eol=lf
+*.yaml      text eol=lf
+*.json      text eol=lf
+*.md        text eol=lf
+
+# Windows shell scripts must keep CRLF on checkout
+*.bat       text eol=crlf
+*.cmd       text eol=crlf
+*.ps1       text eol=crlf
+
+# Binary (don't diff, don't fix)
+*.png       binary
+*.jpg       binary
+*.jpeg      binary
+*.gif       binary
+*.webp      binary
+*.mp4       binary
+*.wav       binary
+*.mp3       binary
+*.srt       text eol=lf
+*.ass       text eol=lf
+
+# Export syntax highlighting / diff hints
+*.md        linguist-documentation
+*.mdx       linguist-documentation
+CHANGELOG.md linguist-documentation
+LICENSE     linguist-documentation

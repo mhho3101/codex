@@ -1,0 +1,289 @@
+from __future__ import annotations
+
+import importlib.util
+import os
+import re
+import sys
+from pathlib import Path
+from typing import Any
+
+from .schema_validation import SCHEMA_BY_FILE, validate_file
+from .utils import executable, ffprobe, read_json
+
+
+def doctor_report() -> dict[str, Any]:
+    return {
+        "python": {
+            "version": sys.version.split()[0],
+            "ok": sys.version_info >= (3, 10),
+        },
+        "ffmpeg": {"path": executable("ffmpeg"), "ok": bool(executable("ffmpeg"))},
+        "ffprobe": {"path": executable("ffprobe"), "ok": bool(executable("ffprobe"))},
+        "python_packages": {
+            "websockets": bool(importlib.util.find_spec("websockets")),
+            "jsonschema": bool(importlib.util.find_spec("jsonschema")),
+            "PIL": bool(importlib.util.find_spec("PIL")),
+            "faster_whisper_optional": bool(importlib.util.find_spec("faster_whisper")),
+        },
+        "environment": {
+            "DOUBAO_API_KEY": bool(os.getenv("DOUBAO_API_KEY")),
+            "DOUBAO_SPEAKER_optional_override": bool(os.getenv("DOUBAO_SPEAKER")),
+            "built_in_voice_profiles": True,
+        },
+    }
+
+
+def doctor_ok(report: dict[str, Any]) -> bool:
+    return bool(
+        report["python"]["ok"]
+        and report["ffmpeg"]["ok"]
+        and report["ffprobe"]["ok"]
+        and report["python_packages"]["websockets"]
+        and report["python_packages"]["jsonschema"]
+    )
+
+
+def _project_image_review_mode(project: dict[str, Any] | None) -> str:
+    if not project:
+        return "none"
+    workflow = project.get("image_workflow", {})
+    return str(workflow.get("review", "none"))
+
+
+def _validate_panel_image(path: Path, *, expected_ratio: float | None) -> list[str]:
+    errors: list[str] = []
+    try:
+        from PIL import Image
+    except ImportError:
+        return ["Pillow is required to validate panel image files"]
+
+    try:
+        with Image.open(path) as image:
+            image.verify()
+        with Image.open(path) as image:
+            width, height = image.size
+    except Exception as exc:  # noqa: BLE001
+        return [f"Panel image is not readable: {path} ({exc})"]
+
+    if width <= 0 or height <= 0:
+        errors.append(f"Panel image has invalid dimensions: {path}")
+    elif expected_ratio and expected_ratio > 0:
+        actual_ratio = width / height
+        relative_delta = abs(actual_ratio - expected_ratio) / expected_ratio
+        if relative_delta > 0.08:
+            errors.append(
+                f"Panel image aspect ratio differs from target by more than 8%: "
+                f"{path} ({width}x{height})"
+            )
+    return errors
+
+
+def expected_panel_filenames(workspace: Path) -> list[str]:
+    storyboard_path = workspace / "work" / "storyboard.json"
+    if not storyboard_path.exists():
+        return []
+    storyboard = read_json(storyboard_path)
+    names: list[str] = []
+    for index, shot in enumerate(storyboard.get("shots", []), start=1):
+        image = Path(str(shot.get("image") or ""))
+        names.append(image.name or f"panel_{index:03d}.png")
+    return names
+
+
+def validate_manual_panels(
+    workspace: Path,
+    *,
+    filenames: list[str] | None = None,
+) -> dict[str, Any]:
+    expected = expected_panel_filenames(workspace)
+    if not expected:
+        expected = sorted(path.name for path in (workspace / "work" / "panels").glob("panel_*.png"))
+
+    provided = filenames if filenames is not None else [
+        path.name for path in (workspace / "work" / "panels").glob("panel_*.png")
+    ]
+    seen: set[str] = set()
+    duplicates: list[str] = []
+    invalid_names: list[str] = []
+    for name in provided:
+        if name in seen and name not in duplicates:
+            duplicates.append(name)
+        seen.add(name)
+        if not re.match(r"^panel_[0-9]{3}\.png$", name):
+            invalid_names.append(name)
+
+    missing = [name for name in expected if name not in seen]
+    unexpected = [name for name in provided if name not in expected]
+
+    errors: list[str] = []
+    for name in invalid_names:
+        errors.append(f"Invalid panel filename: {name}")
+    for name in duplicates:
+        errors.append(f"Duplicate panel filename: {name}")
+    for name in missing:
+        errors.append(f"Missing panel image: {name}")
+    for name in unexpected:
+        errors.append(f"Unexpected panel image: {name}")
+
+    expected_ratio: float | None = None
+    storyboard_path = workspace / "work" / "storyboard.json"
+    if storyboard_path.exists():
+        video = read_json(storyboard_path).get("video", {})
+        width = float(video.get("width", 0) or 0)
+        height = float(video.get("height", 0) or 0)
+        if width > 0 and height > 0:
+            expected_ratio = width / height
+
+    for name in sorted(seen):
+        path = workspace / "work" / "panels" / name
+        if name in invalid_names:
+            continue
+        if not path.exists() or path.stat().st_size == 0:
+            errors.append(f"Panel image is missing or empty: {name}")
+            continue
+        errors.extend(_validate_panel_image(path, expected_ratio=expected_ratio))
+
+    return {
+        "expected": expected,
+        "provided": provided,
+        "missing": missing,
+        "duplicates": duplicates,
+        "invalid_names": invalid_names,
+        "unexpected": unexpected,
+        "ok": not errors,
+        "errors": errors,
+    }
+
+
+def validate_workspace(workspace: Path, *, require_images: bool = False) -> list[str]:
+    errors: list[str] = []
+    candidates = [
+        workspace / "project.json",
+        workspace / "work" / "narration_plan.json",
+        workspace / "work" / "timeline.json",
+        workspace / "work" / "character_bible.json",
+        workspace / "work" / "style_bible.json",
+        workspace / "work" / "continuity_ledger.json",
+        workspace / "work" / "storyboard.json",
+    ]
+    panel_reviews_path = workspace / "work" / "panel_reviews.json"
+    if panel_reviews_path.exists():
+        candidates.append(panel_reviews_path)
+    studio_state_path = workspace / "work" / "studio_state.json"
+    if studio_state_path.exists():
+        candidates.append(studio_state_path)
+
+    project: dict[str, Any] | None = None
+    for path in candidates:
+        if not path.exists():
+            if path.name in {"timeline.json"}:
+                continue
+            errors.append(f"Missing required file: {path}")
+            continue
+        if path.name == "project.json":
+            project = read_json(path)
+        schema_name = SCHEMA_BY_FILE.get(path.name)
+        if schema_name:
+            errors.extend(f"{path.name}: {message}" for message in validate_file(path, schema_name))
+
+    review_mode = _project_image_review_mode(project)
+
+    timeline_path = workspace / "work" / "timeline.json"
+    if timeline_path.exists():
+        timeline = read_json(timeline_path)
+        previous_end = 0.0
+        for segment in timeline.get("segments", []):
+            start, end = float(segment["start"]), float(segment["end"])
+            if end <= start:
+                errors.append(f"Timeline segment {segment['id']} has non-positive duration")
+            if start < previous_end - 0.05:
+                errors.append(f"Timeline segment {segment['id']} overlaps a previous segment unexpectedly")
+            previous_end = max(previous_end, end)
+        if previous_end > float(timeline.get("duration", 0)) + 0.1:
+            errors.append("Timeline duration is shorter than the last segment")
+
+    storyboard_path = workspace / "work" / "storyboard.json"
+    storyboard_shots: list[dict[str, Any]] = []
+    expected_ratio: float | None = None
+    if storyboard_path.exists():
+        storyboard = read_json(storyboard_path)
+        shots = storyboard.get("shots", [])
+        storyboard_shots = shots
+        video = storyboard.get("video", {})
+        width = float(video.get("width", 0) or 0)
+        height = float(video.get("height", 0) or 0)
+        if width > 0 and height > 0:
+            expected_ratio = width / height
+        previous_start = -1.0
+        for shot in shots:
+            start, end = float(shot["start"]), float(shot["end"])
+            if start < previous_start:
+                errors.append(f"Storyboard shots are not sorted at {shot['id']}")
+            if end <= start:
+                errors.append(f"Shot {shot['id']} has non-positive duration")
+            previous_start = start
+            if require_images:
+                image = Path(shot["image"])
+                if not image.is_absolute():
+                    image = workspace / image
+                if not image.exists():
+                    errors.append(f"Missing panel for {shot['id']}: {image}")
+                else:
+                    errors.extend(_validate_panel_image(image, expected_ratio=expected_ratio))
+
+    if review_mode == "strict" and storyboard_shots:
+        reviews_path = workspace / "work" / "panel_reviews.json"
+        reviews = read_json(reviews_path).get("reviews", []) if reviews_path.exists() else []
+        latest: dict[str, dict[str, Any]] = {}
+        for review in reviews:
+            shot_id = str(review.get("shot_id", ""))
+            if not shot_id:
+                continue
+            current = latest.get(shot_id)
+            if current is None or int(review.get("attempt", 0)) >= int(current.get("attempt", 0)):
+                latest[shot_id] = review
+        for shot in storyboard_shots:
+            review = latest.get(str(shot["id"]))
+            if review is None:
+                errors.append(f"Missing visual review for {shot['id']}")
+            elif not bool(review.get("passed")):
+                errors.append(f"Latest visual review failed for {shot['id']}")
+
+    return errors
+
+
+def validate_output(workspace: Path, *, tolerance_seconds: float = 0.25) -> list[str]:
+    errors: list[str] = []
+    silent = workspace / "output" / "silent_video.mp4"
+    final = workspace / "output" / "final_video.mp4"
+    timeline_path = workspace / "work" / "timeline.json"
+
+    for path in [silent, final]:
+        if not path.exists() or path.stat().st_size == 0:
+            errors.append(f"Missing or empty output: {path}")
+            continue
+        try:
+            info = ffprobe(path)
+        except Exception as exc:  # noqa: BLE001
+            errors.append(f"ffprobe failed for {path}: {exc}")
+            continue
+        streams = info.get("streams", [])
+        if not any(stream.get("codec_type") == "video" for stream in streams):
+            errors.append(f"No video stream in {path}")
+        if path == final and not any(stream.get("codec_type") == "audio" for stream in streams):
+            errors.append(f"No audio stream in {path}")
+
+    if timeline_path.exists() and final.exists():
+        timeline = read_json(timeline_path)
+        expected = float(timeline.get("duration", 0))
+        try:
+            actual = float(ffprobe(final).get("format", {}).get("duration", 0))
+            if expected > 0 and abs(actual - expected) > tolerance_seconds:
+                errors.append(
+                    f"Final duration differs from timeline: expected {expected:.3f}s, got {actual:.3f}s"
+                )
+        except Exception as exc:  # noqa: BLE001
+            errors.append(f"Could not compare final duration: {exc}")
+
+    errors.extend(validate_workspace(workspace, require_images=True))
+    return errors

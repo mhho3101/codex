@@ -1,0 +1,16 @@
+__pycache__/
+*.pyc
+.venv/
+venv/
+env/
+ocr-output/
+outputs/
+frames/
+*.mp4
+*.mov
+*.mkv
+*.webm
+*.avi
+cookies.txt
+*.xlsx
+*.inspect.ndjson

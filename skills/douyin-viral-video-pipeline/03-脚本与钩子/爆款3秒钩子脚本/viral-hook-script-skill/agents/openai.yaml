@@ -1,0 +1,7 @@
+interface:
+  display_name: "爆款 3 秒钩子与节奏化短视频脚本生成器"
+  short_description: "生成短视频钩子、口播稿、分镜、发布文案和复盘方案"
+  default_prompt: "Use $viral-hook-script-skill to turn my topic or draft into scored hooks, paced scripts, storyboard, publishing copy, and data review rules."
+policy:
+  allow_implicit_invocation: true
+

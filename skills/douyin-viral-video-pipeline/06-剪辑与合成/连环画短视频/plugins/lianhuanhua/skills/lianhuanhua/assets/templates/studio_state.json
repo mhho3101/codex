@@ -1,0 +1,10 @@
+{
+  "stage": "create",
+  "action": "generate_full_project",
+  "node_status": {
+    "voice": "pending",
+    "storyboard": "pending",
+    "images": "pending",
+    "video": "pending"
+  }
+}

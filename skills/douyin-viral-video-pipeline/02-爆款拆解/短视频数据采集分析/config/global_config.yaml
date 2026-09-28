@@ -1,0 +1,33 @@
+# 短视频解析工具 - 全局配置
+# 修改后需重启 Agent 生效
+
+# ---- 请求控制 ----
+request:
+  timeout: 30          # HTTP 请求超时（秒）
+  retry_times: 3       # 失败重试次数
+  retry_delay: 2       # 重试间隔（秒）
+
+# ---- 爬虫延时 ----
+crawler:
+  delay_per_request: 1.0    # 每次请求间隔
+  delay_per_video: 3.0      # 不同视频间间隔
+  random_delay: true        # 随机抖动 +/-50%
+
+# ---- 代理配置 ----
+proxy:
+  enabled: false
+  http: ""
+  https: ""
+
+# ---- 输出路径 ----
+output:
+  base_dir: "output"
+  excel_subdir: "excel_table"
+  cover_subdir: "cover_export"
+  wordcloud_subdir: "wordcloud_img"
+
+# ---- Excel 格式 ----
+excel:
+  sheet_protection: false
+  auto_width: true
+  freeze_header: true

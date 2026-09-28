@@ -1,0 +1,15 @@
+{
+  "name": "video-story-clip-lite",
+  "version": "0.2.0",
+  "description": "Turn a full movie into 8-15 ready-to-post short clips (50-75s each) with AI planning and lossless cutting. 开源精简版：电影剧情短视频剪辑。",
+  "skills_dir": ".",
+  "skills": [
+    {
+      "name": "video-story-clip-lite",
+      "display_name": "电影剧情短视频剪辑（开源精简版）",
+      "path": ".",
+      "entrypoint": "SKILL.md",
+      "tags": ["video", "editing", "movie", "short-video", "ffmpeg", "chinese", "content-creation"]
+    }
+  ]
+}

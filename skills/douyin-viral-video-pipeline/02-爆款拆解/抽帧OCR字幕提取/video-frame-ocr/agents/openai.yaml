@@ -1,0 +1,4 @@
+interface:
+  display_name: "Video Frame OCR"
+  short_description: "Extract and OCR text from video frames."
+  default_prompt: "Use $video-frame-ocr to extract on-screen text from a local video or a downloaded Douyin video."

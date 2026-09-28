@@ -1,0 +1,30 @@
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+
+# Local credentials and environment
+.env
+.env.*
+*.key
+*.pem
+
+# Generated media and project outputs
+*.mp4
+*.mov
+*.mkv
+*.avi
+*.wav
+*.mp3
+*.aac
+*.srt
+*.csv
+99_临时/
+07_交付/
+
+# Editor and OS files
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/

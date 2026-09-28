@@ -1,0 +1,10 @@
+*.pyc
+.venv
+./dist
+/.qoder
+/output
+/temp
+/logs
+/db
+/.pytest_cache
+/__pycache__

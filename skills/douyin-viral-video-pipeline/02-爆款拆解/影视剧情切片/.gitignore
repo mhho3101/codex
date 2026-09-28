@@ -1,0 +1,36 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+
+# 视频/素材（绝不提交大文件）
+*.mp4
+*.mkv
+*.mov
+*.avi
+*.wmv
+*.flv
+
+# 字幕
+*.srt
+*.ass
+
+# 输出目录
+output/
+out/
+frames/
+*.json.bak
+电影名.json
+
+# 系统
+.DS_Store
+Thumbs.db
+
+# IDE
+.idea/
+.vscode/
+
+# 发布/自检文档（本地保留，不进仓库）
+docs/
