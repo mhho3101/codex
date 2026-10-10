@@ -1,1 +1,0 @@
-"""Packaged system-policy templates."""
