@@ -1,0 +1,4 @@
+# Security floors for parsing untrusted PDFs and images. Keep these synchronized
+# with MINIMUMS in shared/scripts/check_parsers.py.
+PyMuPDF>=1.28.0
+Pillow>=12.3.0

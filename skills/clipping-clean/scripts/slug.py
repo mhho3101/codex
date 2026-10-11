@@ -1,0 +1,1413 @@
+#!/usr/bin/env python3
+"""Compute a polished note's filename slug: <Author>_<short_topic>_<year-or-nd>.
+
+Which 2-4 content words identify the topic is a judgment call and stays with
+you — pass them in with --topic. What this script owns is the mechanical part
+that is easy to get subtly wrong by hand and must come out the same every time:
+first-author resolution (comma-flip, suffix and multi-author guards), surname
+extraction, Title-Casing with acronym and internal-capital preservation,
+punctuation removal, and the image prefix that must match the note stem exactly.
+
+The full rules, with their examples, are in references/filename-slug.md.
+
+CLI
+    python3 slug.py --author "Ruxandra Teslo" --topic "Pancreatic Cancer" --year 2026
+    python3 slug.py --author "Buck, Carlsmith, and Greenblatt" --topic "AI Takeover" --year 2024
+    python3 slug.py --author Smith --author Jones --topic "Synbio Bullish" --year 2024
+    python3 slug.py --no-author --topic "LLMs Deep Dive" --year 2025
+    python3 slug.py --no-author --topic "Evergreen Reference" --undated
+    python3 slug.py --author "Ruxandra Teslo" --title "Pancreatic cancer just met its match" --year 2026
+    python3 slug.py --test          # the reference's own cases, run
+
+    --author    an author name; repeat it for a list, or pass one string holding
+                several names ("Buck, Carlsmith, and Greenblatt") — only the
+                first author is ever used
+    --no-author drop the author segment (no clean human author)
+    --topic     the content words you chose, space- or underscore-separated
+    --title     derive the topic automatically by dropping filler words. A
+                convenience for the easy cases; it marks topic_auto=true in the
+                output and you should check the result reads as a topic. Read
+                `notes` — it lists exactly which words were kept and dropped.
+    --year      4-digit year from the corrected `published`
+    --undated   use the explicit `nd` segment when no publication year exists
+    --acronym   an extra acronym to uppercase (repeatable, or comma-separated):
+                --acronym CRISPR --acronym "EGFR,SNP"
+
+Case in: pass acronyms as they should appear (LLMs, GPT4, OOMs, iPhone, macOS,
+PyTorch). Any word already carrying a capital keeps its own casing; a plain
+lowercase word is Title-Cased; a lowercase word mixing letters and digits is
+uppercased as a unit when its letters are a known acronym (gpt4 -> GPT4),
+otherwise only its first letter is capitalised (web3 -> Web3, covid19 ->
+Covid19); and a lowercase word that is a known acronym is fully uppercased,
+with a plural `s` left lowercase (llms -> LLMs).
+Clipped titles are often sentence-case, so that last rule fires often — but the
+built-in list can't know your field's initialisms, so short words that were
+merely Title-Cased are listed in `notes` for you to check, and `--acronym` is
+how you correct one. Getting this wrong is not cosmetic: the note's stem is
+also the `_fig_<N>` image prefix, so renaming the note by hand afterwards
+orphans its images.
+
+Two mechanical rules the prose rule leaves out, both because a filename has to
+survive them. `+`, `#` and `*` are spelled out rather than dropped (`C++` ->
+`CPlusPlus`, `C#` -> `CSharp`, `C*` -> `CStar`), because dropping them collapses
+four distinct topics onto `C` — the case CONVENTIONS.md §4a names by name — and
+typeset charges fold to ASCII first, so `Ca²⁺` and `Ca2+` are one stem. And the
+slug is capped at MAX_SLUG_BYTES: the stem is also the `_fig_<N>` image prefix,
+so an uncapped one writes the note and then fails every figure of it with
+ENAMETOOLONG. Both trims are reported in `notes`.
+
+Importable
+    first_author(names) -> (str, notes)
+    author_kind(name) -> (kind, why)             # person / publication / unsure
+    surname(name, notes=None) -> str
+    topic_segment(words, acronyms=None, notes=None) -> str
+    topic_from_title(title, limit=4, notes=None) -> list[str]
+    parse_acronyms(values) -> set[str]           # --acronym values + defaults
+    build_slug(author=..., topic=..., title=..., year=..., no_author=False,
+               topic_limit=4, acronyms=None, undated=False) -> dict
+    run_self_test() -> int                       # also `--test`
+    SlugError                                    # degenerate (empty) slug
+
+Output: one JSON object on stdout. Exit 0 normally; 1 when the inputs do not
+establish a safe, dated-or-explicitly-undated filename. Stdlib only.
+"""
+
+import argparse
+import collections
+import json
+import re
+import sys
+import unicodedata
+
+
+# Generational and credential suffixes that are essentially never an ordinary
+# surname, so a trailing one can be dropped on sight.
+SUFFIXES = {"jr", "jr.", "sr", "sr.", "iii", "iv",
+            "phd", "ph.d.", "md", "m.d.", "msc", "bsc", "dphil",
+            "esq", "esq.", "mba", "dds"}
+
+# ...and the ones that are BOTH a suffix and an ordinary short surname or a
+# lone initial. `ma`, `ba`, `do`, `rn`, `ii` and `v` sat in the set above and
+# were dropped on sight, so `--author 'Jack Ma'` produced
+# `Jack_Alibaba_Strategy_2024` — the given name as the author segment, with an
+# empty `notes` list saying nothing happened. That is the worst shape a slug bug
+# takes here: the slug is also the figure-filename prefix (CONVENTIONS §4c, §8b),
+# so every image of that clipping is filed under a stem nobody will ever look
+# for, and the note reads as correct.
+#
+# These are only read as a suffix where the writing MARKS them as one:
+#   * after a comma — `first_author`'s `Name, Suffix` branch, where the comma is
+#     the marker ("Smith, RN" is a credential; "Ma, Jack" is surname-first and
+#     still flips);
+#   * spelled in capitals inside a name that is not itself all-capitals —
+#     `Jane Smith RN`, but not `Jack Ma` (title case) and not `JACK MA` (a
+#     shouted byline, which clipped metadata is full of).
+# Every other reading is left alone and reported in `notes`, because a kept
+# token is visible in the slug while a dropped one is not.
+AMBIGUOUS_SUFFIXES = {"ii", "v", "ma", "ba", "do", "rn"}
+
+# "No clean human author" markers — the cases the slug rule says to drop the
+# author segment for. Anything else is treated as a person's name.
+NON_HUMAN = re.compile(
+    r"^(the\s+)?(editorial\s+team|editors?|editorial\s+board|admin(istrator)?|"
+    r"anonymous|anon|staff|staff\s+writer|newsletter\s+team|team|guest\s+author|"
+    r"contributor|the\s+editors)$", re.IGNORECASE)
+
+# references/filename-slug.md's "No clean human author" rule lists "a
+# publication account" alongside those markers, and the regex above matches
+# none of them: "Quanta Magazine" slugged to
+# the surname `Magazine`, "The Atlantic" to `Atlantic`, "Works in Progress" to
+# `Progress` — an invented author, emitted with no note at all. That is worth
+# catching because the slug is both the note stem and the figure prefix
+# (CONVENTIONS §4c, §8b), so correcting the name by hand afterwards silently
+# orphans every figure of that note.
+#
+# Detection is by masthead SHAPE only — a trailing word no surname is, a leading
+# article, a lowercase word that is no name particle. Nothing here guesses whether
+# a token "looks like" a person: eating a real person's name is the worse of the
+# two failures, so a word that is genuinely both ("Post", "Press") only flags for
+# review, and anything unrecognised keeps its author exactly as before.
+
+# Words a masthead ends in that a surname essentially never is. Closed and short
+# on purpose — every addition is another chance to eat a real name.
+PUBLICATION_TAIL = {
+    "magazine", "journal", "times", "review", "news", "newsletter", "media",
+    "gazette", "herald", "tribune", "chronicle", "substack", "blog", "podcast",
+    "weekly", "daily", "quarterly", "newsroom", "desk", "bureau", "team",
+    "editorial", "editors", "staff", "institute", "foundation", "university",
+    "lab", "labs", "laboratory", "inc", "ltd", "llc", "plc", "gmbh", "corp",
+    "research", "deepmind",
+}
+
+# Both a publication word and a real surname — Emily Post, Bill Press. Too
+# two-way to drop on, so these return "unsure": the author is kept and the call
+# is handed to the operator in `notes`.
+AMBIGUOUS_TAIL = {"post", "press"}
+
+LEADING_ARTICLES = {"the"}
+PUBLICATION_LEADS = {
+    "journal", "works", "institute", "university", "college", "school",
+    "department", "centre", "center", "academy", "society", "association",
+}
+
+# Nobiliary and patronymic particles, which legitimately sit lowercase inside a
+# person's name. Without them the phrase test below would eat "Ludwig van
+# Beethoven" and "van der Waals". "of" and "in" are deliberately absent — they
+# are what makes "Journal of Medicine" and "Works in Progress" read as phrases.
+NAME_PARTICLES = {
+    "van", "von", "de", "del", "della", "der", "den", "di", "da", "das", "dos",
+    "du", "la", "le", "las", "los", "el", "al", "bin", "ibn", "ben", "bar",
+    "ter", "ten", "af", "av", "zu", "y", "e", "mac", "mc", "st", "het", "op",
+}
+
+MULTI_SEP = re.compile(r"\s+and\s+|\s*&\s*|\s*;\s*", re.IGNORECASE)
+
+# Modal verbs and "not". They are filler in a derived topic, but a short one
+# such as CAN (Controller Area Network) can still be an unlisted acronym, so
+# _case_word keeps flagging them.
+MODAL_FILLER = {
+    "may", "might", "can", "could", "will", "would", "should", "must", "not",
+}
+
+# Right after one of these words a modal-spelled word is a noun: "The May Jobs
+# Report", "His Will".
+NOUN_MARKERS = {"a", "an", "the", "his", "her", "its", "my", "your", "our",
+                "their"}
+
+# Articles, prepositions, possessives, auxiliary and modal verbs, "not" and
+# rhetorical filler — dropped from a title when --title derives the topic
+# automatically. Matching ignores case, except that a title with lowercase
+# letters keeps an all-capitals word as an acronym (CAN, IT). A modal-spelled
+# word after an article or possessive, or capitalized inside a sentence-case
+# title, is a noun or a name and stays. "no" is deliberately absent, so
+# phrases like "No Free Lunch" keep it.
+FILLER = {
+    "a", "an", "the", "of", "for", "to", "in", "on", "at", "by", "with", "from",
+    "and", "or", "but", "as", "is", "are", "was", "were", "be", "been", "it",
+    "its", "it's", "this", "that", "these", "those", "i", "im", "i'm", "we",
+    "you", "your", "my", "our", "their", "his", "her", "just", "how", "why",
+    "what", "when", "where", "who", "met", "about", "into", "over", "up",
+    "out", "so", "very", "really", "new", "s",
+} | MODAL_FILLER
+
+# Acronyms and initialisms are fully uppercased (filename-slug.md). Only the
+# documented set plus initialisms that can't collide with an ordinary English
+# word are built in — uppercasing a word that wasn't an acronym is as wrong as
+# failing to uppercase one, so anything ambiguous ("it", "who", "all", "car")
+# is deliberately absent and belongs on --acronym.
+DEFAULT_ACRONYMS = {
+    # the seven the prose names, plus GPU from its plural example
+    "LLM", "RNA", "AI", "KRAS", "GPT", "AGI", "OOM", "GPU",
+    # and initialisms with no lowercase English homograph, so uppercasing them
+    # can't misfire. "WHO", "PET", "SEC", "CAR", "IT" and friends are excluded
+    # for exactly that reason — reach for --acronym when you need one.
+    "ASI", "CPU", "TPU", "NPU", "DNA", "PCR", "CRISPR", "MRI", "RCT", "IVF",
+    "API", "URL", "HTTP", "HTTPS", "PDF", "SDK", "CLI", "GUI", "OS",
+    "FDA", "NIH", "NASA", "EPA", "IPO", "GDP", "CEO", "CTO", "VC", "ML",
+    "NLP", "RL",
+}
+
+# Filenames are an allowlist, not a blocklist. `#`, `$`, `&`, `%`, `@` and `+`
+# used to survive a blocklist that only named the punctuation someone thought
+# of; `#` is the one that breaks things, because `[[C#_And_F#_2020]]` parses in
+# Obsidian as a heading anchor, so wiki-build's `sources:` link to that note
+# silently resolves to nothing. Keep letters, digits, `_`, and the nonspacing
+# or spacing combining marks (Mn/Mc, never a variation selector or the
+# combining grapheme joiner) that follow a kept character; drop everything
+# else — hyphens, emoji and enclosing keycap marks included, per
+# "Smith-Jones -> SmithJones". `isalnum` is Unicode-aware on purpose, so an
+# accented surname survives (Müller, not Mller).
+#
+# These are the symbols that are simply DROPPED. The three below are not.
+SYMBOL_CHARS = "$&%@"
+
+# `+`, `#` and `*` are spelled out instead of dropped, because dropping them
+# collapses distinct topics onto one filename: `C++`, `C#` and `C*` all reduced
+# to `C`, so three notes fought over `C_2026.md` and each overwrote the last —
+# the exact case CONVENTIONS.md §4a names by name ("`C`, `C++`, `C#` and `C*`
+# produce four distinct slugs, not one"). §4a's own rule is kebab-case and this
+# one is Title_Case_Underscored (§4c), so the spelling differs and the fact does
+# not: the three symbols are distinguishable after slugging.
+#
+# The word takes the case of the word it sits in, so `C++` -> `CPlusPlus` and a
+# lowercase `c++` -> `cplusplus` -> `Cplusplus`; either way the three stay
+# three. `-` is deliberately absent: §4c drops hyphens ("Smith-Jones ->
+# SmithJones"), and a charge minus cannot be told from a compound hyphen
+# without §4a's machinery, which is a different rule and not this one's to copy.
+SYMBOL_WORDS = {"+": "Plus", "#": "Sharp", "*": "Star"}
+
+
+def _fold_typeset(word):
+    """Fold typeset digits and signs to ASCII: `Ca²⁺` and `Ca2+` are one thing.
+
+    Per character and only for the compatibility forms that land on a digit or
+    a sign, rather than a blanket NFKC: a full compatibility fold also rewrites
+    the micro sign, ligatures and full-width letters, and this rule keeps a
+    name's own characters (Müller, not Muller).
+    """
+    out = []
+    for ch in word:
+        if ch.isascii():
+            out.append(ch)
+            continue
+        folded = unicodedata.normalize("NFKC", ch)
+        out.append(folded if len(folded) == 1 and folded.isascii()
+                   and (folded.isdigit() or folded in "+-") else ch)
+    return "".join(out)
+
+
+def _spell_symbols(word):
+    """Replace the SYMBOL_WORDS characters with their words, in the word's case.
+
+    Only inside a word that has something else in it. A word that is nothing but
+    these characters is decoration, not a name — `***` and `+++` are a rule or an
+    emphasis run, and spelling them produces `Starstarstar`, a topic segment out
+    of a title that has none. Left alone they empty, which is what raises
+    SlugError rather than writing a file named after punctuation.
+    """
+    if not any(ch in word for ch in SYMBOL_WORDS):
+        return word
+    if not any(ch.isalnum() for ch in word):
+        return word
+    cap = any(ch.isupper() for ch in word)
+    out = []
+    for ch in word:
+        spelled = SYMBOL_WORDS.get(ch)
+        if spelled is None:
+            out.append(ch)
+        else:
+            out.append(spelled if cap else spelled.lower())
+    return "".join(out)
+
+
+def _ignorable_mark(ch):
+    """Invisible selectors that are Mn but never part of a letter's spelling.
+
+    A variation selector turns `5` into a keycap emoji (`5` + VS16 + U+20E3)
+    and the combining grapheme joiner only steers rendering; kept, either
+    leaves an invisible character in the note filename and figure prefix.
+    """
+    code = ord(ch)
+    return (code == 0x034F or 0xFE00 <= code <= 0xFE0F
+            or 0xE0100 <= code <= 0xE01EF)
+
+
+def _strip_punct(word):
+    # NFC first: a decomposed "u" + combining diaeresis would otherwise lose the
+    # accent (which is not alphanumeric) and silently become a plain "u".
+    # Nonspacing and spacing marks with no precomposed form (Devanagari vowel
+    # signs and viramas, Thai tone marks) stay attached to the kept character
+    # they follow; dropping them silently changes the word ("ข่าว", news,
+    # becomes "ขาว", white). Enclosing marks (a keycap's U+20E3) are emoji
+    # decoration and are dropped; invisible selectors are skipped without
+    # detaching a later mark, and the result is renormalized.
+    word = unicodedata.normalize("NFC", word)
+    out, attached = [], False
+    for ch in word:
+        if _ignorable_mark(ch):
+            continue
+        attached = (ch.isalnum() or ch == "_"
+                    or (attached and unicodedata.category(ch) in ("Mn", "Mc")))
+        if attached:
+            out.append(ch)
+    return unicodedata.normalize("NFC", "".join(out))
+
+
+def _reported_drops(raw, cleaned):
+    """Whether cleaning removed an emoji, a symbol or a mark, not punctuation.
+
+    Ordinary punctuation (quotes, dashes, `.`) disappears silently; a removed
+    non-ASCII symbol, mark or format character (an emoji and its selectors,
+    a keycap, `™`) changed what the word looked like, so it is reported.
+    """
+    if not cleaned:
+        return False
+    kept = collections.Counter(unicodedata.normalize("NFC", cleaned))
+    for ch in _spell_symbols(_fold_typeset(unicodedata.normalize("NFC", raw))):
+        if kept[ch]:
+            kept[ch] -= 1
+        elif not ch.isascii() and unicodedata.category(ch) in (
+                "So", "Sk", "Mn", "Mc", "Me", "Cf"):
+            return True
+    return False
+
+
+def _clean_word(raw):
+    """One raw title word, ready to be cased: typeset folded, symbols spelled,
+    everything else that is not a letter, a digit, `_` or a nonspacing or
+    spacing combining mark on a kept character removed."""
+    return _strip_punct(_spell_symbols(_fold_typeset(raw)))
+
+
+class SlugError(ValueError):
+    """Raised when the inputs reduce to an empty slug."""
+
+
+def _suffix_kind(token):
+    """``"clear"``, ``"ambiguous"`` or ``None`` for one trailing name token."""
+    t = (token or "").strip().lower()
+    if not t:
+        return None
+    bare = t.rstrip(".")
+    if t in SUFFIXES or bare in {x.rstrip(".") for x in SUFFIXES}:
+        return "clear"
+    if t in AMBIGUOUS_SUFFIXES or bare in AMBIGUOUS_SUFFIXES:
+        return "ambiguous"
+    return None
+
+
+def _reads_as_credential(token, rest):
+    """Is this ambiguous trailing token *written* the way a credential is?
+
+    Credentials are written in capitals (`RN`, `MD`, `II`); surnames are not
+    (`Ma`, `Do`, `Ba`). That only means something when the rest of the name
+    disagrees, so an all-capitals byline is left alone rather than read as a
+    two-letter credential — and a lone initial (`Sid V`) is not enough evidence
+    either way, so it is kept and reported.
+    """
+    letters = [c for c in token if c.isalpha()]
+    if len(letters) < 2 or not all(c.isupper() for c in letters):
+        return False
+    return any(c.islower() for t in rest for c in t)
+
+
+#: A Vancouver/PubMed byline puts capital initials after the surname:
+#: `Smith J`, `Smith JK`, `Smith J.K.`.
+_INITIALS_RE = re.compile(r"[A-Z](?:\.?[A-Z]){0,2}\.?")
+
+#: Real surnames with no A/E/I/O/U, often printed in capitals (`Kelvin NG`).
+_VOWELLESS_SURNAMES = {"NG", "LY"}
+
+
+def _initials_reading(prev, token):
+    """How a short all-capitals token after the word ``prev`` reads.
+
+    ``"initials"`` when it can only be initials (one letter, a dot, or no vowel:
+    `J`, `J.K.`, `JK`); ``"maybe"`` when it is also a plausible surname (`LEE`,
+    `LI`, or a known vowel-less surname such as `NG`); otherwise ``None``. ``prev`` must be a word of two or more letters
+    with a lowercase letter: an all-capitals byline (`ANDREW NG`) carries no
+    such signal.
+    """
+    if not _INITIALS_RE.fullmatch(token):
+        return None
+    letters = [c for c in prev if c.isalpha()]
+    if len(letters) < 2 or not any(c.islower() for c in letters):
+        return None
+    bare = token.replace(".", "")
+    if bare in _VOWELLESS_SURNAMES and "." not in token:
+        return "maybe"
+    if len(bare) == 1 or "." in token or not any(c in "AEIOU" for c in bare):
+        return "initials"
+    return "maybe"
+
+
+def first_author(names):
+    """Pick the first author out of a list, or out of one mashed-together string.
+
+    A comma flips surname-first order ("Smith, John" -> "John Smith") only when
+    it genuinely marks that: not when it separates different people, and not
+    when what follows it is a generational or credential suffix. A comma after
+    a Vancouver-style name (`Smith J, Jones K`) separates people.
+    """
+    notes = []
+    if isinstance(names, str):
+        names = [names]
+    names = [n.strip() for n in names if n and n.strip()]
+    if not names:
+        return "", ["no author given"]
+    if len(names) > 1:
+        notes.append("author list: took the first entry")
+        names = names[:1]
+
+    s = names[0]
+    is_list = bool(MULTI_SEP.search(s)) or s.count(",") > 1
+    if is_list:
+        # a list of people, not a surname-first name: take the part before the
+        # first separator and ignore the rest
+        head = MULTI_SEP.split(s)[0]
+        head = head.split(",")[0]
+        return head.strip(), notes + ["multi-author string: took the portion before the first separator"]
+
+    if s.count(",") == 1:
+        before, after = [p.strip() for p in s.split(",")]
+        kind = _suffix_kind(after)
+        if kind:
+            notes.append(f"dropped trailing suffix {after!r} (not surname-first)")
+            if kind == "ambiguous":
+                notes.append(f"{after!r} is also an ordinary surname — the comma "
+                             "is what read it as a suffix here; drop the comma "
+                             "if it is the name")
+            return before, notes
+        head = before.split()
+        if len(head) >= 2 and _initials_reading(head[-2], head[-1]) == "initials":
+            return before, notes + ["multi-author string: took the portion before the first separator"]
+        if before and after:
+            notes.append("surname-first name: flipped to natural order")
+            return f"{after} {before}", notes
+    return s, notes
+
+
+def author_kind(name):
+    """Classify a resolved author: ``("person" | "publication" | "unsure", why)``.
+
+    ``publication`` is a no-clean-human-author case and the segment is dropped;
+    ``unsure`` is kept, because a slug missing an author is a visible gap the
+    operator can fix, while a slug carrying an invented surname looks correct and
+    is only found once the figures have gone missing. ``why`` is the sentence the
+    caller puts in `notes` — every one of these calls is reported, never silent.
+    """
+    s = " ".join((name or "").split())
+    if not s:
+        return "person", None
+    if re.fullmatch(r"@[A-Za-z0-9_]+", s):
+        return "publication", "is a social account handle, not a verified human byline"
+    if re.fullmatch(r"[A-Za-z](?:\.)?", s):
+        return "publication", "is only an initial, not a verifiable surname"
+    if NON_HUMAN.match(s):
+        return "publication", "an editorial or anonymous byline, not a person"
+    toks = s.split()
+    tail = _strip_punct(toks[-1]).lower()
+    if tail in PUBLICATION_TAIL:
+        return "publication", "ends in %r, a publication word" % toks[-1]
+    if len(toks) > 1 and toks[0].lower() in LEADING_ARTICLES:
+        return "publication", "starts with an article, which a personal name does not"
+    if len(toks) > 1 and toks[0].lower() in ("a", "an"):
+        return "unsure", ("starts with %r, which may be an article or a given "
+                          "name" % toks[0])
+    # A lowercase word inside an otherwise capitalised name makes it a phrase
+    # rather than a name ("Works in Progress"). Particles are the exception, which
+    # is why "Ludwig van Beethoven", "van der Waals" and "Gerard 't Hooft" stay
+    # people — and one capitalised token is required before the test runs at all,
+    # since clipped metadata is often all-lowercase and "ruxandra teslo" is a
+    # person, not a masthead. A lowercase prefix before an internal capital,
+    # as in d'Ormesson or d’Hondt, is still part of a personal name.
+    if len(toks) > 1 and any(t[:1].isupper() for t in toks):
+        stray = [t for t in toks
+                 if t.islower() and _strip_punct(t).lower() not in NAME_PARTICLES]
+        if stray:
+            explanation = "reads as a phrase, not a simple personal name (%s)" % \
+                ", ".join(repr(t) for t in stray)
+            if _strip_punct(toks[0]).lower() in PUBLICATION_LEADS:
+                return "publication", explanation
+            # Historical/byname forms such as “Richard of York” have this
+            # shape too. Keep the visible segment but require review rather
+            # than silently deleting a real person's surname.
+            return "unsure", explanation
+    if tail in AMBIGUOUS_TAIL:
+        return "unsure", ("ends in %r, which is both a publication word and a "
+                          "real surname" % toks[-1])
+    return "person", None
+
+
+def surname(name, notes=None):
+    """Last whitespace-separated token, original case, punctuation removed.
+
+    A trailing generational or credential suffix is dropped — but only one that
+    cannot also be a surname. The tokens that can (`AMBIGUOUS_SUFFIXES`) are
+    dropped only when they are *written* as a credential, and either way the
+    call is recorded in `notes` instead of being applied silently: this function
+    picks the author segment, which is also the figure-filename prefix, so a
+    wrong answer files a whole clipping's images under a stem nothing looks for.
+    """
+    toks = [t for t in name.split() if t]
+    while len(toks) > 1:
+        kind = _suffix_kind(toks[-1])
+        if kind == "clear":
+            toks.pop()
+            continue
+        if kind == "ambiguous":
+            token, rest = toks[-1], toks[:-1]
+            if _reads_as_credential(token, rest):
+                if notes is not None:
+                    notes.append(
+                        f"dropped trailing {token!r}: capitals inside a name "
+                        "that is not, so it reads as a credential rather than "
+                        f"a surname — pass --author {' '.join(toks)!r} if it "
+                        "really is the surname")
+                toks.pop()
+                continue
+            if notes is not None:
+                notes.append(
+                    f"kept {token!r} as the author segment: it is both an "
+                    "ordinary surname and a suffix, and nothing here marks it "
+                    "as a suffix — re-run with it removed from --author if it "
+                    "is one")
+        break
+    # Vancouver order: `Smith J` would otherwise file every figure under `J`.
+    # An ambiguous suffix (`Sid V`) was already kept and reported above.
+    if len(toks) >= 2 and _suffix_kind(toks[-1]) is None:
+        reading = _initials_reading(toks[-2], toks[-1])
+        if reading == "initials":
+            if notes is not None:
+                notes.append(f"read {' '.join(toks[-2:])!r} as surname + "
+                             "initials (Vancouver order); check the author "
+                             "segment")
+            toks = toks[:-1]
+        elif reading == "maybe" and notes is not None:
+            notes.append(f"kept {toks[-1]!r} as the author segment, but it may "
+                         f"be initials after the surname {toks[-2]!r}; check it")
+    # a name that is NOTHING but a clear suffix names nobody: better an empty
+    # author segment (which `build_slug` reports) than a note called `Jr_…`.
+    if len(toks) == 1 and _suffix_kind(toks[0]) == "clear":
+        toks = []
+    if not toks:
+        return ""
+    return _strip_punct(toks[-1])
+
+
+_PLURAL_ACRONYM_RE = re.compile(r"^[a-z]{2,5}s$")
+_SHORT_WORD_RE = re.compile(r"^[a-z]{2,5}$")
+
+
+def _case_word(w, acronyms=None, uncertain=None):
+    if not w:
+        return w
+    acronyms = DEFAULT_ACRONYMS if acronyms is None else acronyms
+    if any(c.isupper() for c in w):
+        return w                                  # LLMs, iPhone, macOS, PyTorch, GPT4
+    if any(c.isdigit() for c in w) and any(c.isalpha() for c in w):
+        letters = "".join(c for c in w if c.isalpha())
+        if letters.upper() in acronyms:
+            return w.upper()                      # gpt4 -> GPT4
+        if w[:1].isdigit():
+            return w                              # 1st, 10x
+        return w[0].upper() + w[1:]               # web3 -> Web3
+    if w.upper() in acronyms:
+        return w.upper()                          # agi -> AGI
+    if _PLURAL_ACRONYM_RE.match(w) and w[:-1].upper() in acronyms:
+        return w[:-1].upper() + "s"               # ooms -> OOMs, llms -> LLMs
+    if (uncertain is not None and _SHORT_WORD_RE.match(w)
+            and (w not in FILLER or w in MODAL_FILLER)):
+        uncertain.append(w)                       # could be an unlisted acronym
+    return w[0].upper() + w[1:]                   # plain word -> Title Case
+
+
+def topic_segment(words, acronyms=None, notes=None):
+    """Title-Case the chosen content words and join them with underscores."""
+    if isinstance(words, str):
+        words = re.split(r"[\s_]+", words)
+    out, uncertain, symbol_words, spelled_words, emptied = [], [], [], [], []
+    for raw in words:
+        raw = raw.strip()
+        w = _clean_word(raw)
+        if not w:
+            if raw:
+                emptied.append(raw)
+            continue
+        if (any(ch in raw for ch in SYMBOL_CHARS)
+                or _reported_drops(raw, w)):
+            symbol_words.append(f"{raw} → {w}")
+        if any(ch in raw for ch in SYMBOL_WORDS):
+            spelled_words.append(f"{raw} → {w}")
+        out.append(_case_word(w, acronyms, uncertain))
+    if notes is not None:
+        if uncertain:
+            notes.append(
+                "Title-Cased short words that could be unlisted acronyms: "
+                + ", ".join(sorted(set(uncertain)))
+                + " — re-run with --acronym <WORD> for any that should be "
+                  "uppercase")
+        if spelled_words:
+            notes.append("symbols spelled out: " + "; ".join(spelled_words)
+                         + " — dropping them would collapse C++, C# and C* onto "
+                           "one filename")
+        if symbol_words:
+            notes.append("symbols removed from: " + "; ".join(symbol_words)
+                         + " — check the words still read distinctly")
+        if emptied:
+            notes.append("dropped (no filename-safe characters): "
+                         + ", ".join(emptied))
+    return "_".join(out)
+
+
+def topic_from_title(title, limit=4, notes=None):
+    """Advisory: drop filler words from a title and keep the first few left.
+
+    Deliberately crude — it drops a fixed filler list and keeps word order, so a
+    title whose topic isn't simply "its first content words" comes out wrong
+    ("Pancreatic cancer just met its match" keeps `Match`). That is why it sets
+    topic_auto and why `notes` spells out kept vs dropped: the point is to give
+    you something to check, not something to trust. Pass --topic to decide.
+    """
+    raw_words = [x for x in re.split(r"[\s_]+", title) if x]
+    cleaned = [(x, _clean_word(x)) for x in raw_words]
+    words = [w for _, w in cleaned if w]
+    reduced = [f"{x} → {w}" for x, w in cleaned if _reported_drops(x, w)]
+    # A title with lowercase letters marks an acronym by writing it in
+    # capitals; an all-capitals title marks nothing.
+    shouted = not any(c.islower() for c in title)
+    # A sentence-case title writes its content words in lowercase, so a
+    # capitalized modal-spelled word inside it is a name ("Theresa May
+    # resigns"). A Title-Case title capitalizes modal verbs too.
+    content = [w for w in words[1:] if w[:1].isalpha()
+               and w.lower() not in FILLER and not w.isupper()]
+    lower = sum(w[:1].islower() for w in content)
+    sentence_case = lower > 0 and lower >= len(content) - lower
+
+    def is_filler(k, w):
+        if w.lower() not in FILLER:
+            return False
+        if not shouted and len(w) > 1 and w.isupper():
+            return False                          # an acronym: CAN, IT
+        if w.lower() in MODAL_FILLER and k and (
+                words[k - 1].lower() in NOUN_MARKERS
+                or (sentence_case and w[:1].isupper())):
+            return False                          # a noun or a name
+        return True
+
+    filler = [is_filler(k, w) for k, w in enumerate(words)]
+    kept = [w for w, is_filler in zip(words, filler) if not is_filler]
+    dropped = [w for w, is_filler in zip(words, filler) if is_filler]
+    over_limit = kept[limit:]
+    kept = kept[:limit]
+    if notes is not None:
+        notes.append("topic from title — kept: "
+                     + (", ".join(kept) if kept else "(nothing)"))
+        if dropped:
+            notes.append("topic from title — dropped as filler: "
+                         + ", ".join(dropped))
+        if over_limit:
+            notes.append(f"topic from title — dropped past --topic-limit "
+                         f"{limit}: " + ", ".join(over_limit))
+        if reduced:
+            notes.append("topic from title — emoji, symbols or marks "
+                         "removed from: " + "; ".join(reduced))
+    return kept
+
+
+def parse_acronyms(values):
+    """Fold --acronym values (repeatable, comma-separated) into the default set."""
+    acronyms = set(DEFAULT_ACRONYMS)
+    for value in values or []:
+        for item in re.split(r"[,\s]+", str(value)):
+            item = _strip_punct(item.strip())
+            if item:
+                acronyms.add(item.upper())
+    return acronyms
+
+
+#: The longest slug this rule may produce, in BYTES.
+#:
+#: The stem is not only the note's name: it is also the `_fig_<N>.<ext>` image
+#: prefix (§4c, §8b), so the longest name that has actually has to land on disk is
+#: about thirteen bytes longer than the slug. There was no cap at all, and a
+#: clipped title that survived as four long words produced a ~250-character
+#: slug: `Articles/<slug>.md` fitted (255 is the usual limit), every
+#: `<slug>_fig_<N>.png` did not, and the run reported a clean note whose embeds
+#: all resolved to nothing — ENAMETOOLONG surfacing as missing figures, one step
+#: away from where it happened. 180 leaves room for the longest figure tail
+#: (`_fig_999.jpeg`) inside the 200-byte limit pdf-organize holds every derived
+#: basename to (`organize.py`'s MAX_NAME_BYTES), so the two skills agree about
+#: what fits.
+MAX_SLUG_BYTES = 180
+
+
+def _byte_len(text):
+    return len(text.encode("utf-8"))
+
+
+def _truncate_bytes(text, limit):
+    """`text` cut to at most `limit` bytes, never splitting a character."""
+    if limit <= 0:
+        return ""
+    return text.encode("utf-8")[:limit].decode("utf-8", "ignore")
+
+
+def _join_segments(author_seg, topic_seg, year_seg):
+    return "_".join(s for s in (author_seg, topic_seg, year_seg) if s)
+
+
+def _fit(author_seg, topic_seg, year_seg, notes=None):
+    """Trim the segments until the joined slug fits MAX_SLUG_BYTES.
+
+    The TOPIC gives, from the end, and the author and year are kept whole: those
+    two are the note's identity and the topic is already an abbreviation, so
+    losing its fourth word costs a shade of meaning while losing the year costs
+    the pairing with the source. A single topic word longer than the whole
+    budget is cut rather than dropped — a truncated topic still says what the
+    note is about, an empty one does not — and only an author segment that
+    overflows on its own is cut, which takes garbage metadata to produce.
+
+    Every trim is reported in `notes`: the operator's slug is not what they
+    typed, and a silent truncation is how two long titles end up sharing a stem.
+    """
+    if _byte_len(_join_segments(author_seg, topic_seg, year_seg)) <= MAX_SLUG_BYTES:
+        return author_seg, topic_seg
+    words = [w for w in topic_seg.split("_") if w]
+    dropped = []
+    while len(words) > 1 and _byte_len(_join_segments(
+            author_seg, "_".join(words), year_seg)) > MAX_SLUG_BYTES:
+        dropped.insert(0, words.pop())
+    topic_seg = "_".join(words)
+    truncated = []
+    if _byte_len(_join_segments(author_seg, topic_seg, year_seg)) > MAX_SLUG_BYTES:
+        fixed = _byte_len(_join_segments(author_seg, "", year_seg))
+        room = MAX_SLUG_BYTES - fixed - (1 if fixed else 0)
+        if room > 0:
+            truncated.append(topic_seg)
+            topic_seg = _truncate_bytes(topic_seg, room).rstrip("_")
+        else:
+            dropped.extend(words)
+            topic_seg = ""
+            truncated.append(author_seg)
+            room = MAX_SLUG_BYTES - _byte_len(year_seg) - (1 if year_seg else 0)
+            author_seg = _truncate_bytes(author_seg, room).rstrip("_")
+    if notes is not None:
+        notes.append(
+            "slug capped at %d bytes — %s. The stem is also the figure prefix, "
+            "so an over-long one writes the note and then fails every image "
+            "with ENAMETOOLONG. Pass a shorter --topic if this reads badly."
+            % (MAX_SLUG_BYTES,
+               "; ".join(filter(None, [
+                   "dropped " + ", ".join(dropped) if dropped else "",
+                   "truncated " + ", ".join(truncated) if truncated else ""]))))
+    return author_seg, topic_seg
+
+
+def build_slug(author=None, topic=None, title=None, year=None, no_author=False,
+               topic_limit=4, acronyms=None, undated=False):
+    notes = []
+    author_seg = ""
+    topic_auto = False
+
+    if not no_author:
+        picked, anotes = first_author(author or [])
+        notes.extend(anotes)
+        kind, why = author_kind(picked)
+        if picked and kind == "publication":
+            notes.append(f"no clean human author ({picked!r}: {why}) — author segment dropped")
+        elif picked:
+            if kind == "unsure":
+                notes.append(f"kept {picked!r} as the author segment, but it {why} — "
+                             f"re-run with --no-author if it is a publication")
+            author_seg = surname(picked, notes)
+            if not author_seg:
+                notes.append("could not resolve a surname — author segment dropped")
+    else:
+        notes.append("author segment dropped on request")
+
+    if topic:
+        words = topic
+    elif title:
+        notes.append("topic derived from the title automatically — check it reads as a topic")
+        words = topic_from_title(title, topic_limit, notes)
+        topic_auto = True
+    else:
+        words = []
+    topic_seg = topic_segment(words, acronyms, notes)
+    if topic:
+        topic_words = [piece for piece in topic_seg.split("_") if piece]
+        if not 2 <= len(topic_words) <= 4:
+            notes.append(
+                "explicit topic has %d surviving content word%s; clipping "
+                "filenames normally use 2–4 — confirm the shorter/longer "
+                "topic is necessary" %
+                (len(topic_words), "" if len(topic_words) == 1 else "s"))
+    if not topic_seg:
+        raise SlugError(
+            "no usable topic words survived; choose 2–4 identifying words "
+            "from the verified title")
+
+    if undated and year:
+        raise SlugError("year and undated are mutually exclusive")
+    if not undated and not year:
+        raise SlugError("give a publication year or mark the source undated")
+    year_seg = "nd" if undated else ""
+    if year:
+        m = re.fullmatch(r"([0-9]{4})(?:-[0-9]{2}-[0-9]{2})?", str(year))
+        if not m or m.group(1) == "0000":
+            raise SlugError(
+                "publication year must be four digits from 0001 to 9999; got %r"
+                % (year,))
+        year_seg = m.group(1)
+
+    author_seg, topic_seg = _fit(author_seg, topic_seg, year_seg, notes)
+    slug = _join_segments(author_seg, topic_seg, year_seg)
+    slug = unicodedata.normalize("NFC", slug)
+    if not slug:
+        # Returning "" is worse than failing: os.path.join(cleaned, "") writes to
+        # the directory, and image_prefix "" hands fetch_images an empty --slug.
+        raise SlugError(
+            "author=%r topic=%r title=%r year=%r reduce to an empty slug — "
+            "nothing survived punctuation removal. Choose the topic words "
+            "yourself with --topic (and a --year) rather than writing a file "
+            "named '.md'." % (author, topic, title, year))
+    return {
+        "author_segment": author_seg,
+        "topic_segment": topic_seg,
+        "topic_auto": topic_auto,
+        "year_segment": year_seg,
+        "slug": slug,
+        "filename": slug + ".md",
+        "image_prefix": slug + "_fig_",
+        "ok": True,
+        "notes": notes,
+    }
+
+
+def run_self_test():
+    """Every case `references/filename-slug.md` ships, plus the shapes that
+    break a filename.
+
+    The reference's examples were prose: nothing executed them, so the rule they
+    state and the rule this file implements could differ without anything
+    noticing. Every author case, every topic case and every combined example
+    there is one case here. The rest are the inputs that produce an unusable
+    stem — symbol-only words, typeset charges, an empty slug, a name too long
+    for the filesystem — because the stem is also the figure prefix, so a slug
+    that is wrong or unwritable takes the note's whole image set with it.
+    """
+    cases = []
+
+    def check(label, got, want):
+        cases.append((label, got == want, got, want))
+
+    def slug_of(**kw):
+        # SlugError is a result here, not a crash: a suite that dies on the
+        # first surprise reports one line instead of the whole picture.
+        try:
+            return build_slug(**kw)["slug"]
+        except SlugError:
+            return "SlugError"
+
+    # --- author segment: every case references/filename-slug.md ships -------
+    for label, given, want in (
+            ("plain name", "Ruxandra Teslo", "Teslo"),
+            ("particles: the last token is the surname",
+             "Jürgen van der Berg", "Berg"),
+            ("surname-first flips", "Smith, John", "Smith"),
+            ("a suffix after the comma is not a given name",
+             "Martin Luther King, Jr.", "King"),
+            ("hyphen dropped, casing kept", "Mary Smith-Jones", "SmithJones"),
+            ("`and` list: the first author only", "Teslo and Smith", "Teslo"),
+            ("comma list: the first author only",
+             "Buck, Carlsmith, and Greenblatt", "Buck"),
+            ("`&` list: the first author only", "Smith & Jones", "Smith"),
+            ("`;` list: the first author only", "Smith; Jones", "Smith"),
+            ("surname-first with particles flips too",
+             "van der Berg, Jürgen", "Berg"),
+            ("Vancouver surname + initial", "Smith J", "Smith"),
+            ("Vancouver surname + initials", "Smith JK", "Smith")):
+        picked, _why = first_author(given)
+        check("author %s (%r)" % (label, given), surname(picked), want)
+    # Vancouver/PubMed bylines put capital initials after the surname. The
+    # segment is also the figure prefix, so `J` would misfile every image.
+    for given in ("Smith J", "Smith J.K.", "Kim JH"):
+        initials_notes = []
+        check("surname + initials is read and reported (%r)" % given,
+              (surname(given, initials_notes),
+               any("surname + initials" in n for n in initials_notes)),
+              (given.split()[0], True))
+    check("a Vancouver list is not a surname-first name",
+          first_author("Smith J, Jones K"),
+          ("Smith J", ["multi-author string: took the portion before the "
+                       "first separator"]))
+    for given, want in (("Jun LEE", "LEE"), ("Kelvin NG", "NG"),
+                        ("Thanh LY", "LY")):
+        maybe_notes = []
+        check("a capitalised token that may be a surname is kept and "
+              "reported (%r)" % given,
+              (surname(given, maybe_notes),
+               any("may be initials" in n for n in maybe_notes)), (want, True))
+    for given in ("Kim YS", "Wang YJ"):
+        initials_notes = []
+        check("Y is not a vowel: %r still reads as surname + initials" % given,
+              (surname(given, initials_notes),
+               any("surname + initials" in n for n in initials_notes)),
+              (given.split()[0], True))
+    plain_notes = []
+    check("an ordinary or all-capitals name has no initials reading",
+          (surname("John Smith", plain_notes), surname("ANDREW NG", plain_notes),
+           plain_notes), ("Smith", "NG", []))
+    check("...end to end, a Vancouver byline slugs by surname",
+          slug_of(author=["Smith J", "Jones K"], topic="Cell Signals", year=2026),
+          "Smith_Cell_Signals_2026")
+    # authors normally arrive as a YAML list: the first entry is the first author
+    check("author list: the first entry wins",
+          surname(first_author(["Ruxandra Teslo", "John Smith"])[0]), "Teslo")
+    check("a structured author list still resolves a surname-first first name",
+          slug_of(author=["Smith, John", "Jones, Mary"],
+                  topic="Cell Signals", year=2026),
+          "Smith_Cell_Signals_2026")
+    check("a structured author list still drops the first author's comma suffix",
+          slug_of(author=["Martin Luther King, Jr.", "Jane Doe"],
+                  topic="Civil Rights", year=2026),
+          "King_Civil_Rights_2026")
+    # the two suffix guards are separate, and each covers what the other does
+    # not: the comma one keeps `King, Jr.` from flipping to `Jr. Martin Luther
+    # King`, and `surname`'s keeps `Martin Luther King Jr.` — no comma at all —
+    # from sluggifying as `Jr`.
+    check("a suffix after the comma is dropped, not flipped",
+          first_author("Martin Luther King, Jr.")[0], "Martin Luther King")
+    for given, want in (("Martin Luther King Jr.", "King"),
+                        ("Ruxandra Teslo PhD", "Teslo"),
+                        ("John Smith III", "Smith")):
+        check("a suffix with no comma is dropped too (%r)" % given,
+              surname(given), want)
+    check("a name that is nothing but a suffix resolves to no surname",
+          surname("Jr."), "")
+
+    # --- a suffix list holding ordinary surnames ----------------------------
+    # `ma`, `ba`, `do`, `rn`, `ii` and `v` were in SUFFIXES and dropped on
+    # sight, so `--author 'Jack Ma'` slugged as `Jack_…` — the GIVEN name — and
+    # `notes` was empty. The slug is the figure-filename prefix (§8b), so the
+    # note looked right while its images went under a stem nothing looks for.
+    for given, want in (("Jack Ma", "Ma"),
+                        ("Yo-Yo Ma", "Ma"),
+                        ("Kim Do", "Do"),
+                        ("Ibrahima Ba", "Ba"),
+                        ("Naosuke Ii", "Ii"),
+                        ("Jürgen van der Ma", "Ma")):
+        check("a short surname is not a suffix (%r)" % given,
+              surname(given), want)
+    check("...end to end, the slug carries the surname, not the given name",
+          slug_of(author="Jack Ma", topic="Alibaba Strategy", year=2024),
+          "Ma_Alibaba_Strategy_2024")
+    # ...and it is never silent: a token that is both gets a note either way.
+    kept_notes = []
+    check("keeping an ambiguous token is reported, not silent",
+          (surname("Jack Ma", kept_notes), len(kept_notes)), ("Ma", 1))
+    check("...and the note reaches build_slug's output",
+          any("Ma" in n for n in build_slug(author="Jack Ma", topic="Alibaba",
+                                            year=2024)["notes"]), True)
+    check("an unambiguous suffix stays silent, because there is no call to make",
+          surname("Ruxandra Teslo PhD", []) and [], [])
+
+    # The credential reading is still available where the writing marks it:
+    # capitals inside a name that is not, or a comma.
+    for given, want in (("Jane Smith RN", "Smith"),
+                        ("John Smith II", "Smith"),
+                        ("Ruxandra Teslo MD", "Teslo"),
+                        ("W E B Du Bois DDS", "Bois")):
+        check("a capitalised credential inside a mixed-case name is dropped (%r)"
+              % given, surname(given), want)
+    # A LONE INITIAL is not evidence either way — `Martin Luther King V` reads
+    # as generational, `Sid V` reads as a stage name, and one capital letter
+    # cannot tell them apart. So it is kept (the visible answer) and reported,
+    # which is the rule for every call this function cannot make confidently.
+    for given in ("Martin Luther King V", "Sid V"):
+        lone = []
+        check("a lone initial is kept and reported, not guessed (%r)" % given,
+              (surname(given, lone), len(lone)), ("V", 1))
+    dropped_notes = []
+    check("...and that drop is reported too",
+          (surname("Jane Smith RN", dropped_notes), len(dropped_notes)),
+          ("Smith", 1))
+    # a shouted byline is not evidence of a credential — clipped metadata is
+    # full of them, and `MA` there is the surname
+    check("an all-capitals byline keeps its last token", surname("JACK MA"),
+          "MA")
+    # a comma is the other marker, and it does not disturb the surname-first flip
+    check("a comma marks even an ambiguous suffix",
+          surname(first_author("Smith, RN")[0]), "Smith")
+    check("...while a surname-first name with a given name still flips",
+          surname(first_author("Ma, Jack")[0]), "Ma")
+    check("...and the comma-suffix drop says the token is also a surname",
+          sum("also an ordinary surname" in n
+              for n in first_author("Smith, RN")[1]), 1)
+    # "no clean human author" — the four the reference names — drops the segment
+    for given in ("Editorial Team", "Anonymous", "Quanta Magazine", ""):
+        check("no clean human author (%r) drops the segment" % given,
+              build_slug(author=given, topic="Deep Dive",
+                         year=2025)["author_segment"], "")
+    check("...and the slug is then topic_year",
+          slug_of(author="Editorial Team", topic="Deep Dive", year=2025),
+          "Deep_Dive_2025")
+    for given, want in (("Jean d'Ormesson", "dOrmesson"),
+                        ("Victor d’Hondt", "dHondt")):
+        check("an attached lowercase name particle keeps its surname (%r)" % given,
+              slug_of(author=given, topic="Voting Systems", year=2025),
+              want + "_Voting_Systems_2025")
+    check("a lowercase phrase word still identifies a publication",
+          slug_of(author="Works in Progress", topic="Voting Systems", year=2025),
+          "Voting_Systems_2025")
+    uncertain_person = build_slug(author="Richard of York",
+                                  topic="English History", year=2025)
+    check("a phrase-shaped historical byline is retained but flagged",
+          (uncertain_person["author_segment"],
+           any("not a simple personal name" in note
+               for note in uncertain_person["notes"])),
+          ("York", True))
+    check("a leading 'An' may be a given name, so it is kept and flagged",
+          [(row["author_segment"], len(row["notes"])) for row in
+           (build_slug(author="An Wang", topic="Deep Dive", year=2025),
+            build_slug(author="The Atlantic", topic="Deep Dive", year=2025))],
+          [("Wang", 1), ("", 1)])
+    for given in ("@asklivermore", "J", "J.", "Citrini Research",
+                  "Google DeepMind"):
+        check("an account/organization is not invented into a surname (%r)" % given,
+              build_slug(author=given, topic="Market Research",
+                         year=2025)["author_segment"], "")
+
+    # --- topic segment: every case the reference ships ----------------------
+    for title_words, want in (
+            ("Pancreatic Cancer", "Pancreatic_Cancer"),
+            ("LLMs Deep Dive", "LLMs_Deep_Dive"),
+            ("llms deep dive", "LLMs_Deep_Dive"),      # sentence-case clipping
+            ("Synbio Bullish", "Synbio_Bullish"),
+            ("Transformer Genomics", "Transformer_Genomics"),
+            ("GPT-4 AGI OOMs", "GPT4_AGI_OOMs"),
+            ("gpt4 agi ooms", "GPT4_AGI_OOMs"),
+            ("web3 10x 1st", "Web3_10x_1st"),
+            ("Intelligence Explosion", "Intelligence_Explosion"),
+            ("Start Google", "Start_Google"),
+            # a word carrying an internal capital keeps its own casing
+            ("iPhone macOS PyTorch eLife", "iPhone_macOS_PyTorch_eLife")):
+        check("topic %r" % title_words, topic_segment(title_words), want)
+    # "Other punctuation is removed, not replaced": the words either side of an
+    # em-dash join, they do not become two words or gain a separator.
+    check("punctuation is removed, not replaced",
+          topic_segment("What's Next: AI—Now?"), "Whats_Next_AINow")
+    # the one reference title whose topic really is "its first content words",
+    # so the --title convenience gets it right
+    check("--title derivation, filler dropped",
+          slug_of(title="How to start Google", no_author=True, year=2025),
+          "Start_Google_2025")
+    # ...and the one it deliberately gets wrong, which is why it is advisory
+    check("--title derivation keeps a word a human would drop",
+          slug_of(title="Pancreatic cancer just met its match",
+                  no_author=True, year=2026), "Pancreatic_Cancer_Match_2026")
+    # 2-4 content words: the fifth is dropped, and the drop is reported rather
+    # than leaving the operator to notice their topic lost a word
+    _long = "How deep learning transforms protein structure prediction accuracy"
+    _r = build_slug(title=_long, no_author=True, year=2025)
+    check("--title keeps at most --topic-limit words",
+          _r["slug"], "Deep_Learning_Transforms_Protein_2025")
+    check("...and says which words it dropped past the limit",
+          any("past --topic-limit" in n for n in _r["notes"]), True)
+    check("--topic-limit is honoured",
+          slug_of(title=_long, no_author=True, year=2025, topic_limit=2),
+          "Deep_Learning_2025")
+    # modal verbs and "not" are filler, so they cannot push a content word
+    # past the limit
+    check("--title drops modals and negation",
+          slug_of(title="Why Aging May Be a Program, Not a Breakdown",
+                  no_author=True, year=2026), "Aging_Program_Breakdown_2026")
+    check("...but keeps NO, which can be an acronym",
+          slug_of(title="How NO Signaling Controls Blood Pressure",
+                  no_author=True, year=2026), "NO_Signaling_Controls_Blood_2026")
+    # an all-capitals word in a mixed-case title is an acronym, even when it
+    # spells a filler word; an all-capitals title marks nothing
+    check("...and keeps CAN, an acronym spelled like a modal",
+          slug_of(title="CAN Bus Attacks on Modern Cars", no_author=True,
+                  year=2024), "CAN_Bus_Attacks_Modern_2024")
+    check("...but an all-capitals title still drops its filler",
+          slug_of(title="WHY AGING MAY BE A PROGRAM", no_author=True,
+                  year=2026), "AGING_PROGRAM_2026")
+    # a modal-spelled word after an article is a noun, and a capitalized one
+    # inside a sentence-case title is a name
+    check("...but keeps a month after an article",
+          slug_of(title="The May Jobs Report Surprised Economists",
+                  no_author=True, year=2024), "May_Jobs_Report_Surprised_2024")
+    check("...and a name in a sentence-case title",
+          slug_of(title="Theresa May resigns as prime minister",
+                  no_author=True, year=2019), "Theresa_May_Resigns_Prime_2019")
+    check("...while a sentence-case title still drops its modals",
+          slug_of(title="Why aging may be a program, not a breakdown",
+                  no_author=True, year=2026), "Aging_Program_Breakdown_2026")
+    _can = build_slug(topic="can bus security", no_author=True, year=2024)
+    check("--topic still flags a modal as a possible unlisted acronym",
+          any("unlisted acronyms: bus, can " in n for n in _can["notes"]), True)
+
+    # --- the three combined worked examples --------------------------------
+    check("combined: Teslo 2026",
+          build_slug(author="Ruxandra Teslo", topic="Pancreatic Cancer",
+                     year=2026)["filename"],
+          "Teslo_Pancreatic_Cancer_2026.md")
+    check("combined: anonymous editorial 2025",
+          build_slug(author="Anonymous", topic="LLMs Deep Dive",
+                     year=2025)["filename"], "LLMs_Deep_Dive_2025.md")
+    check("combined: first author only, 2024",
+          build_slug(author="Smith & Jones", topic="Synbio Bullish",
+                     year=2024)["filename"], "Smith_Synbio_Bullish_2024.md")
+    # the image prefix IS the stem: a divergence orphans every figure
+    built = build_slug(author="Ruxandra Teslo", topic="Pancreatic Cancer",
+                       year=2026)
+    check("image prefix is the stem plus _fig_",
+          built["image_prefix"], built["slug"] + "_fig_")
+
+    # --- symbols that used to collapse onto one slug ------------------------
+    # CONVENTIONS.md §4a names this case: C, C++, C# and C* are four things.
+    # They were four titles reducing to `C`, so three of the four notes fought
+    # over one filename and each overwrote the last.
+    for topic, want in (("C", "C"), ("C++", "CPlusPlus"), ("C#", "CSharp"),
+                        ("C* Search", "CStar_Search"), ("F#", "FSharp"),
+                        ("A* Pathfinding", "AStar_Pathfinding"),
+                        ("c++", "Cplusplus")):
+        check("symbol topic %r" % topic, topic_segment(topic), want)
+    check("the four C slugs are four",
+          len({topic_segment(t) for t in ("C", "C++", "C#", "C*")}), 4)
+    # a symbol that is still dropped is still reported
+    _n = []
+    check("dropped symbols are reported", bool(topic_segment("R&D Spend", None, _n)
+                                               and _n), True)
+    check("...and the word survives", topic_segment("R&D Spend"), "RD_Spend")
+    # typeset charges fold to their ASCII spelling: `Ca²⁺` and `Ca2+` are one
+    # thing written two ways and must not produce two stems
+    check("typeset charge", topic_segment("Ca²⁺ Signalling"),
+          "Ca2Plus_Signalling")
+    check("ASCII charge agrees", topic_segment("Ca2+ Signalling"),
+          "Ca2Plus_Signalling")
+    check("a subscript folds too", topic_segment("H₂O Transport"),
+          "H2O_Transport")
+
+    # --- alphabets and characters that are not ASCII ------------------------
+    # Greek capitals are letters: they survive, they are not Title-Cased away,
+    # and a hyphen inside the word is dropped like any other.
+    for topic, want in (("ΔG Estimation", "ΔG_Estimation"),
+                        ("Σ-Algebra", "ΣAlgebra"),
+                        ("Ω Notation", "Ω_Notation"),
+                        ("Α-Helix Folding", "ΑHelix_Folding")):
+        check("Greek capital %r" % topic, topic_segment(topic), want)
+    # CJK and Arabic are alphanumeric, so they survive rather than emptying the
+    # slug. (§4a's kebab rule raises on these; this is the §4c rule, whose
+    # output is a note filename and may carry the user's own script.)
+    check("CJK survives", topic_segment("機械学習"), "機械学習")
+    check("Arabic survives", topic_segment("التعلم الآلي"), "التعلم_الآلي")
+    # Combining vowel signs, viramas and tone marks with no precomposed form
+    # stay on their letter; dropping them changes the word, silently.
+    for topic, want in (("हिन्दी साहित्य", "हिन्दी_साहित्य_2026"),
+                        ("தமிழ் இலக்கியம்", "தமிழ்_இலக்கியம்_2026"),
+                        ("ภาษาไทย ข่าว", "ภาษาไทย_ข่าว_2026")):
+        check("combining marks survive (%r)" % topic,
+              slug_of(no_author=True, topic=topic, year=2026), want)
+    # Only letters' own marks (Mn/Mc) attach. A keycap's variation selector
+    # and enclosing mark are emoji decoration: kept, they left an invisible
+    # VS16 in the filename and figure prefix.
+    for label, kw, want in (
+            ("keycap topic", dict(topic="5️⃣ robot trends"),
+             "5_Robot_Trends_2026"),
+            ("keycap title", dict(title="Top 5️⃣ robot trends"),
+             "Top_5_Robot_Trends_2026"),
+            ("variation selector on a letter", dict(topic="a️ robots"),
+             "A_Robots_2026"),
+            ("combining grapheme joiner", dict(topic="a͏ robots"),
+             "A_Robots_2026")):
+        check("%s: selectors and enclosing marks are dropped" % label,
+              slug_of(no_author=True, year=2026, **kw), want)
+    check("a mark after a skipped selector stays on its letter, renormalized",
+          (_strip_punct("a️́"), _strip_punct(_strip_punct("a️́"))),
+          ("á", "á"))
+    _k = build_slug(no_author=True, year=2026, topic="5️⃣ robot trends")
+    _kt = build_slug(no_author=True, year=2026, title="Top 5️⃣ robot trends")
+    check("a dropped keycap is reported on the topic and title paths",
+          (any("5️⃣ → 5" in n for n in _k["notes"]),
+           any("removed from: 5️⃣ → 5" in n for n in _kt["notes"])),
+          (True, True))
+    _plain = build_slug(no_author=True, year=2026,
+                        topic="Smith-Jones “Quoted” Topic")
+    check("ordinary punctuation drops stay unreported",
+          any("removed from" in n for n in _plain["notes"]), False)
+    check("an accented surname keeps its accent",
+          surname("Jürgen Müller"), "Müller")
+    # an emoji is not alphanumeric: it is dropped, and the drop is reported
+    _n = []
+    check("emoji dropped", topic_segment("🚀 Launch Costs", None, _n),
+          "Launch_Costs")
+    check("...and reported", any("dropped" in m for m in _n), True)
+    check("an emoji-only topic empties",
+          topic_segment("🚀🔥"), "")
+
+    # --- the degenerate slug ------------------------------------------------
+    # Returning "" is worse than failing: os.path.join(cleaned, "") writes to
+    # the directory itself and image_prefix "" hands fetch_images an empty slug.
+    for label, kw in (
+            ("all-punctuation topic",
+             dict(topic="--- *** ???", no_author=True, undated=True)),
+            ("all-punctuation topic and author",
+             dict(author="!!!", topic="???", undated=True)),
+            ("nothing at all", dict(no_author=True, undated=True))):
+        try:
+            got = build_slug(**kw)["slug"]
+        except SlugError:
+            got = "SlugError"
+        check("%s raises rather than returning an empty slug" % label,
+              got, "SlugError")
+    check("a year cannot stand in for the missing topic identity",
+          slug_of(topic="***", no_author=True, year=2026), "SlugError")
+
+    # --- the length cap -----------------------------------------------------
+    long_word = "Supercalifragilistic" * 15                  # 300 chars
+    res = build_slug(author="Teslo", topic=long_word, year=2026)
+    check("an over-long single topic word is cut to the cap",
+          _byte_len(res["slug"]) <= MAX_SLUG_BYTES, True)
+    check("...and the year survives it", res["slug"].endswith("_2026"), True)
+    check("...and the author survives it", res["slug"].startswith("Teslo_"), True)
+    check("...and the truncation is reported",
+          any("capped" in n for n in res["notes"]), True)
+    # Four fifty-character words: three fit beside the author and the year, the
+    # fourth does not. The topic gives from the END, so the slug is pinned
+    # exactly — a cap that dropped from the front would keep the wrong words and
+    # a cap that dropped the year would lose the pairing with the source.
+    _w = ["Alpha" + "x" * 45, "Bravo" + "y" * 45, "Charlie" + "z" * 43]
+    res = build_slug(author="Teslo", topic=" ".join(_w + ["Delta" + "q" * 45]),
+                     year=2026)
+    check("over-long topic words are dropped whole, from the end",
+          res["slug"], "Teslo_" + "_".join(_w) + "_2026")
+    check("...and the drop is reported by name",
+          any("Delta" in n for n in res["notes"]), True)
+    check("the figure prefix fits a real filesystem name too",
+          len((res["image_prefix"] + "999.jpeg").encode("utf-8")) <= 200, True)
+    # a slug that already fits is untouched — the cap must not round-trip
+    check("a short slug is left exactly alone",
+          slug_of(author="Teslo", topic="Pancreatic Cancer", year=2026),
+          "Teslo_Pancreatic_Cancer_2026")
+    # multi-byte characters are counted in bytes, and never cut in half
+    res = build_slug(no_author=True, topic="機" * 200, year=2026)
+    check("a multi-byte topic is capped in bytes",
+          _byte_len(res["slug"]) <= MAX_SLUG_BYTES, True)
+    check("...without splitting a character",
+          res["slug"] == unicodedata.normalize("NFC", res["slug"])
+          and "�" not in res["slug"], True)
+
+    # --- year segment -------------------------------------------------------
+    check("a year is found inside a date",
+          slug_of(no_author=True, topic="Deep Dive", year="2025-03-04"),
+          "Deep_Dive_2025")
+    check("the public API requires a date decision",
+          slug_of(no_author=True, topic="Deep Dive"), "SlugError")
+    check("an unparseable year is refused rather than silently dropped",
+          slug_of(no_author=True, topic="Deep Dive", year="undated"),
+          "SlugError")
+    check("an explicitly undated source gets the canonical nd segment",
+          slug_of(no_author=True, topic="Deep Dive", undated=True),
+          "Deep_Dive_nd")
+    check("year and undated cannot both name one source",
+          slug_of(no_author=True, topic="Deep Dive", year=2025,
+                  undated=True), "SlugError")
+
+    check("an undated short acronym topic keeps its required suffix",
+          slug_of(no_author=True, topic="CON", undated=True), "CON_nd")
+    check("an acronym remains intact within a longer topic",
+          slug_of(no_author=True, topic="CON Model", undated=True),
+          "CON_Model_nd")
+    check("an authored acronym topic retains its date",
+          slug_of(author="Smith", topic="CON", year=2026),
+          "Smith_CON_2026")
+
+    # --- the reference's own examples have to be reproducible from it --------
+    # references/filename-slug.md said "a one-author, plain-English title needs
+    # nothing beyond the script", which reads as `--title`. Seven of its eight
+    # examples do not come out of `--title` — it drops a filler list and keeps
+    # the first few words left, so "Pancreatic cancer just met its match" keeps
+    # `Match`. The slug is the image-filename prefix, so the two paths file one
+    # clipping's figures under two stems. `--topic` is the documented path and
+    # reproduces every example; these cases pin both halves of that.
+    _doc_examples = (
+        ("Pancreatic cancer just met its match", "Pancreatic Cancer",
+         "Pancreatic_Cancer"),
+        ("How LLMs work: a deep dive", "LLMs Deep Dive", "LLMs_Deep_Dive"),
+        ("Why I'm bullish on synbio", "Synbio Bullish", "Synbio_Bullish"),
+        ("A new transformer architecture for genomics",
+         "Transformer Genomics", "Transformer_Genomics"),
+        ("From GPT-4 to AGI: counting the OOMs", "GPT-4 AGI OOMs",
+         "GPT4_AGI_OOMs"),
+        ("From AGI to superintelligence: the intelligence explosion",
+         "Intelligence Explosion", "Intelligence_Explosion"),
+        ("How to start Google", "Start Google", "Start_Google"))
+    for title, topic, want in _doc_examples:
+        check("--topic reproduces the documented example %r" % want,
+              build_slug(topic=topic, year=2026)["topic_segment"], want)
+    off = [want for title, _topic, want in _doc_examples
+           if build_slug(title=title, year=2026)["topic_segment"] != want]
+    check("...while --title does not, which is why it is advisory",
+          len(off) >= 6, True)
+    _t = build_slug(title="Pancreatic cancer just met its match", year=2026)
+    check("a --title run marks itself automatic", _t["topic_auto"], True)
+    check("...and says in notes what it kept, so it can be checked",
+          any("kept" in n for n in _t["notes"]), True)
+    check("a --topic run claims nothing automatic",
+          build_slug(topic="Pancreatic Cancer", year=2026)["topic_auto"], False)
+
+    # ...and the reference must not tell the reader otherwise. `os` is imported
+    # here rather than at module scope: nothing in the slug rule itself touches
+    # the filesystem, and it should stay that way.
+    import os
+    _ref = os.path.normpath(os.path.join(
+        os.path.dirname(os.path.abspath(__file__)), "..", "references",
+        "filename-slug.md"))
+    try:
+        with open(_ref, encoding="utf-8") as _fh:
+            _md = _fh.read()
+    except OSError as _exc:
+        _md = ""
+        cases.append(("references/filename-slug.md sits next to this script",
+                      False, "%s: %s" % (type(_exc).__name__, _exc),
+                      "readable"))
+    check("the reference no longer says the script alone is enough",
+          "needs nothing beyond the script" in _md, False)
+    check("...and names --topic as the documented path",
+          bool(re.search(r"`--topic` example.{0,80}documented path|"
+                         r"--topic.{0,60}documented path", _md)), True)
+    check("...and warns that --title is a suggestion to check",
+          bool(re.search(r"suggestion to check", _md)), True)
+
+    failed = [c for c in cases if not c[1]]
+    for label, ok, got, want in cases:
+        if not ok:
+            print("FAIL  %s\n        got  %r\n        want %r"
+                  % (label, got, want))
+    print("%d/%d self-test cases pass" % (len(cases) - len(failed), len(cases)))
+    return 1 if failed else 0
+
+
+def main(argv=None):
+    reconfigure = getattr(sys.stdout, "reconfigure", None)
+    if callable(reconfigure):
+        try:
+            reconfigure(encoding="utf-8", errors="backslashreplace")
+        except (OSError, ValueError):
+            pass
+    ap = argparse.ArgumentParser(description=__doc__.split("\n")[0])
+    ap.add_argument("--author", action="append", default=[],
+                    help="verified author name; repeat for additional authors")
+    ap.add_argument("--no-author", action="store_true",
+                    help="use the documented unknown-author filename form")
+    ap.add_argument("--topic",
+                    help="reviewed 2–4 word topic phrase (preferred)")
+    ap.add_argument("--title",
+                    help="verified title used only to suggest a topic")
+    date = ap.add_mutually_exclusive_group()
+    date.add_argument("--year",
+                      help="verified four-digit publication year")
+    date.add_argument("--undated", action="store_true",
+                      help="use the canonical nd suffix for a source with no "
+                           "evidence-backed publication year")
+    ap.add_argument("--topic-limit", type=int, default=4,
+                    help="maximum topic words when --title suggests it (default: 4)")
+    ap.add_argument("--acronym", action="append", default=[],
+                    help="extra acronym to uppercase; repeatable or comma-separated")
+    ap.add_argument("--test", action="store_true", help="run the self-test")
+    args = ap.parse_args(argv)
+
+    if args.test:
+        return run_self_test()
+
+    if not args.topic and not args.title:
+        ap.error("give --topic (preferred) or --title")
+    if args.year is None and not args.undated:
+        ap.error("give --year YYYY or --undated")
+    if (args.year is not None
+            and (not re.fullmatch(r"[0-9]{4}", args.year)
+                 or args.year == "0000")):
+        ap.error("--year must be four digits from 0001 to 9999")
+
+    try:
+        result = build_slug(author=args.author, topic=args.topic,
+                            title=args.title, year=args.year,
+                            no_author=args.no_author,
+                            topic_limit=args.topic_limit,
+                            acronyms=parse_acronyms(args.acronym),
+                            undated=args.undated)
+    except SlugError as exc:
+        print(json.dumps({"slug": None, "filename": None, "image_prefix": None,
+                          "ok": False, "error": str(exc)},
+                         indent=2, ensure_ascii=False))
+        return 1
+
+    print(json.dumps(result, indent=2, ensure_ascii=False))
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

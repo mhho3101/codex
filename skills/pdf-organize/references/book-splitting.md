@@ -1,0 +1,222 @@
+# Book splitting
+
+Read this when the [organizer book test](../SKILL.md#5-test-for-a-book-and-split-only-when-justified)
+identifies a book, or when the user explicitly requests chapter PDFs. Finish
+any required guarded rename first; the selected book must have a stable
+canonical name. Use `scripts/organize.py pages` and `split`.
+
+## 1. Choose the chapter folder and check for an existing split
+
+Inside a vault, chapters go in a folder named after the book, directly under
+`Sources/PDFs/`: `Sources/PDFs/Kuhn_StructSciRev_2012/`. Outside a vault,
+that folder goes beside the book. Either way, pass its absolute path as
+`--out` and do not create it beforehand: `split --apply` creates it and
+removes it again if the split fails. **The original book stays where it is;
+chapters are additions, not replacements.**
+
+If that folder, or the chapter folder of the book's other copy (the same
+stem with or without `_src`, such as `Kuhn_StructSciRev_2012_src/`), already
+contains chapter-pattern PDFs of this book, stop and report that the book was
+split before. The two copies share one chapter set. Those filenames are
+authoritative. Never re-abbreviate
+an existing set: a future explicitly requested re-split must reuse those
+names or not proceed. The helper refuses occupied targets; an existing set
+is not permission to overwrite or delete it.
+
+Keep chapters in the shared source tree so recursive consumers find them;
+`figure-extract`, `paper-summarize`, and `wiki-build` own how they treat a
+book beside its chapters.
+
+## 2. Find and verify chapter boundaries
+
+Use two passes, preferring a table of contents:
+
+1. Look in the first roughly ten pages for chapter titles and printed start
+   pages, such as `Chapter 1: Introduction ... 1`, `I. The Problem ... 23`, or
+   an unnumbered chapter title. Distinguish roman-numbered front matter from
+   arabic-numbered body pages. Map printed page numbers to physical PDF pages
+   by inspecting the page text, which `pages` lists by physical page; **do
+   not assume a constant offset without checking it**.
+2. If there is no usable TOC, scan headings throughout the book. Look for
+   `Chapter N`, recurring prominent headings on new pages, or standalone
+   chapter title pages. Do not infer reliable boundaries from page count
+   alone.
+
+Extract actual chapters only. Skip prefaces, forewords, introductions unless
+labeled as a chapter, epilogues, afterwords, appendices, acknowledgments,
+indexes, bibliographies/references, notes, glossaries, author biographies, and
+lists of figures or tables. Ignore “Part” groupings and extract the chapters
+within them.
+
+A chapter ends at the next chapter's start. The last ends at the first
+excluded back-matter section, or the end of the book if there is none.
+
+**The chapter list uses zero-based physical PDF indices.** `start_idx` is the
+first included page and `end_idx` is the page **after** the last included page.
+These are not printed folio numbers or the one-based page numbers used by the
+figure-cropping tools. For example, physical pages 43–78 use `start_idx=42`
+and `end_idx=78`.
+
+Copy `heading_text` from the chapter's opening page in the output of the
+read-only `pages` command. It prints each physical page's text exactly as
+`split` verifies headings (lowercased, whitespace collapsed), beside the
+page's one-based number and its `start_idx`:
+
+```bash
+python3 '<skill>/scripts/organize.py' pages '<book PDF path>' --range 1-12
+python3 '<skill>/scripts/organize.py' pages '<book PDF path>' \
+    --find '<chapter 1 heading>' --find '<chapter 2 heading>'
+```
+
+`--range A-B` lists only those physical pages; without it, and without
+`--find`, every page is listed. Give `--find` once for every planned heading:
+it lists the pages carrying each one, treats a page that lists two or more of
+them as contents, and exits 1 when `split` would refuse a heading as too
+short, absent outside the contents, or a likely running header; the `split`
+plan still checks each start page.
+
+A heading must appear on no more than two non-contents pages; otherwise the
+helper refuses it as a likely running header. If running headers repeat the
+title, extend it with the line the opening page prints after the title;
+include the chapter label only where that page prints it with the title, and
+never use a bare label (`Chapter 2`).
+
+The helper moves a start whose page lacks the heading to the nearest page
+within ±2 that carries it, never a contents page (any page listing two or more
+planned headings); a tie, a larger offset, or an unmatched heading is
+refused. It also takes in a standalone title page just before the start. The
+plan reports every correction, trimmed end and page left to no chapter. These
+adjustments do not replace checking the TOC-to-page mapping.
+
+## 3. Choose chapter names once
+
+Use `AuthorLastName_AbbreviatedTitle_Year_##_AbbreviatedChapterName.pdf`.
+Reuse the book's author, abbreviated title, and year. Use its printed chapter
+numbers, zero-padded to two digits. If chapters are unnumbered, only partly
+numbered, or restart within parts, number every chapter sequentially from
+`01` in book order instead; the helper requires strictly increasing numbers.
+Abbreviate the chapter title in recognizable CamelCase, retaining
+distinguishing words and avoiding new or ambiguous acronyms.
+
+| Chapter | Filename |
+|---|---|
+| 1: Introduction: A Role for History | `Kuhn_StructSciRev_2012_01_RoleHistory.pdf` |
+| 2: The Route to Normal Science | `Kuhn_StructSciRev_2012_02_RouteNormSci.pdf` |
+| 3: The Nature of Normal Science | `Kuhn_StructSciRev_2012_03_NatureNormSci.pdf` |
+
+Keep the canonical relationship `<book core stem>_NN_Name`; do not shorten
+the book title again for its chapters. “Core” removes only the `_src`
+representation marker, **not** a `_2` or `_3` disambiguator. A chapter does not
+inherit its book's `_src`: `Prince_UDL_2026_src.pdf` produces
+`Prince_UDL_2026_01_Intro.pdf`. If a chapter already has its own marker, the
+tail goes **after** the chapter name, as in
+`Prince_UDL_2026_01_Intro_src.pdf`.
+
+A disambiguated book cannot be split under this grammar. The helper refuses
+it; distinguish the books in the abbreviated title before the year, carry
+that change through the [guarded rename workflow](../SKILL.md#3-check-references-and-prepare-the-complete-rename-plan),
+then split. Do not strip the disambiguator or borrow the other book's chapter
+identity. Use `organize.py canonical` or the
+[shared naming functions](../../../shared/CONVENTIONS.md#1a-source-file-names-and-why-pdf-organize-runs-first)
+rather than recreating the naming grammar.
+
+Each resulting filename becomes the exact source stem for figures and note
+references. It must be unique both in its destination and throughout the
+vault, including case variants; the split helper checks this before writing.
+
+## 4. Build the complete chapter list and split
+
+Store a JSON array of chapter objects in a **unique scratch directory** from
+runtime setup. Keep the original heading separately from the output name:
+
+```json
+[
+  {
+    "heading_text": "Chapter 2 The Route to Normal Science",
+    "filename": "Kuhn_StructSciRev_2012_02_RouteNormSci.pdf",
+    "start_idx": 42,
+    "end_idx": 78
+  }
+]
+```
+
+The page indices above illustrate the format, not verified boundaries for a
+particular edition. Build and inspect the complete list for the actual PDF.
+
+Plan first. Without `--apply`, `split` prints the final ranges and every
+note, writes nothing, and creates no folder:
+
+```bash
+python3 '<skill>/scripts/organize.py' split '<book PDF path>' \
+    --chapters '<scratch>/chapters.json' \
+    --out '<vault>/Sources/PDFs/<book stem>' --vault '<vault>'
+```
+
+Plan lines and notes give one-based physical pages: `pages A-B` means
+`start_idx = A - 1` and `end_idx = B`.
+
+A corrected start or a trimmed end means the page mapping may be off:
+re-check every start and end against the TOC mapping, put the verified values
+in the JSON, and re-plan. A title page taken in, and an end that moved with
+it, are expected and need no re-plan. Pages left to no chapter must be
+deliberate exclusions, such as back matter or an excluded section. Only then
+repeat the same command with `--apply`.
+
+Outside a vault, omit `--vault` and put `--out` beside the book; report that
+only destination checks ran. With a vault in scope always pass `--vault`: each
+plan and apply checks vault-wide names afresh, including names an earlier
+rename or split in the same batch created.
+
+The helper resolves **all chapters before writing any**, on every call. Every
+heading must map to a verified start, all ranges must be in bounds and
+non-overlapping, and every filename must be a canonical chapter name of this
+book in increasing chapter order, remain under 200 bytes, and have an
+unoccupied destination both locally and vault-wide. With a vault, a new
+chapter stem must not already name any `Articles/` note or `_fig*` image, even
+one left by an earlier split of this book, because the helper cannot tell who
+derived it. Such a stem follows the SKILL's
+[target-stem rule](../SKILL.md#3-check-references-and-prepare-the-complete-rename-plan)
+for each chapter: for figure-extract crops or a reading note of this same
+chapter, keep the book unsplit and ask that rule's question; for any other
+occupant, re-plan now under another chapter name and split.
+Occupied symlinks and case-equivalent names also block.
+A refused split lists every unresolved problem and exits nonzero; do not
+bypass one by extracting just the chapters that passed.
+
+During writing, the helper stages chapter files and rolls back files created
+by this operation on failure. It does not replace the original book or remove
+pre-existing user files. Read the returned notes and CLI diagnostics before
+claiming success.
+
+## 5. Verify and report
+
+Report created filenames and physical page ranges, any adjusted start/end
+pages, uncovered pages, and unresolved boundaries. For a chapter named around
+another source's files, also report its natural name and those occupants.
+Say explicitly that the original book was kept. A refused or unreadable book is a per-file batch
+outcome; report its message in plain language and continue other independent
+files.
+
+If whole-book figures already exist under the book's stem in
+`Sources/Images/`, name them as possible duplicates of future chapter figures
+for review. Do not automatically remove them or claim byte equality without
+checking. This skill does not extract or delete figures.
+
+## Conditions that stop the split
+
+- **No detectable chapters or uncertain page mapping:** report what could
+  not be established. Do not create an empty folder or invent boundaries.
+  Ask for manual ranges only after completing any independent work.
+- **Scanned or garbled text:** the split verifies headings against the
+  book's own text layer, so it cannot split a book without a usable one.
+  Renders or OCR of a scratch copy may inform proposed, unverified ranges in
+  the report; never split the copy, and never OCR or replace the original.
+- **Corrupt download, HTML saved as PDF, or zero-byte input:** report the
+  open error. This needs a valid source, not OCR.
+- **Encrypted input that cannot be unlocked:** report and stop that file.
+- **Already a single chapter or an existing split:** leave the chapter set
+  intact; a chapter may be renamed through the normal guard within its
+  `<book core>_NN_Name` form, not split again.
+- **Parser check fails (including missing or outdated `pypdf`):** follow
+  runtime dependency guidance, and run neither `pages` nor `split` in that
+  interpreter. The stdlib rename helper remains available.

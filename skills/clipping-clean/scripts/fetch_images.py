@@ -1,0 +1,9720 @@
+#!/usr/bin/env python3
+"""Stage/place a clipping's images, or rename owned images on a reprocess.
+
+This is the mechanical image transport and publication path, done the same way
+every time: a browser
+User-Agent on every request (CDNs 403 a default urllib/curl agent), a temp file
+OUTSIDE Sources/Images with no image extension, the real type detected from the
+bytes rather than trusted from the URL, and a move — not a copy — into
+<Sources/Images>/<slug>_fig_<N>.<ext>. Doing it by hand is what produces the
+broken extension-twin (a .png written from a URL guess sitting next to the
+.webp the MIME check produced).
+
+What stays with you: deciding which images are figures, finding and normalizing
+captions, rewriting the body's references to `![[…]]` embeds, and inserting a
+`<!-- image download failed: [redacted source locator] -->` placeholder for
+anything reported failed here. Use the helper's redacted ``url`` field rather
+than copying a signed query string or inline payload from the source. Those
+rules are in references/images.md.
+
+CLI
+    python3 fetch_images.py stage --vault '<vault>' --out-dir '<scratch>/images' \\
+        --slug Teslo_Pancreatic_Cancer_2026 [--start 1] URL [URL ...]
+    python3 fetch_images.py stage ... --urls-file list.txt     # one URL per line, - for stdin
+    python3 fetch_images.py fetch '<lottie source url>' \\
+        [--out '<path>' --vault '<vault>']
+    python3 fetch_images.py place --attachments '<vault>/Sources/Images' \\
+        --owner-note '<vault>/Articles/Teslo_Pancreatic_Cancer_2026.md' \\
+        --slug Teslo_Pancreatic_Cancer_2026 --index 3 --from-file '<rendered file>'
+    python3 fetch_images.py rename --phase publish-note [--dry-run] \\
+        --vault '<vault>' --snapshots '<scratch>/clipping-snapshots.json' \\
+        --draft '<scratch>/draft.md' \\
+        --owner-note '<vault>/Articles/Old_Slug_2025.md' \\
+        --old-slug Old_Slug_2025 --new-slug New_Slug_2026 \\
+        --new-owner-note '<vault>/Articles/New_Slug_2026.md'
+    python3 fetch_images.py rename --phase prepare [--dry-run] \\
+        --attachments '<vault>/Sources/Images' --sources '<vault>/Sources/PDFs' \\
+        --owner-note '<vault>/Articles/Old_Slug_2025.md' \\
+        --old-slug Old_Slug_2025 --new-slug New_Slug_2026 \\
+        --new-owner-note '<vault>/Articles/New_Slug_2026.md'
+    python3 fetch_images.py rename --phase repair [--dry-run] \\
+        --attachments '<vault>/Sources/Images' --sources '<vault>/Sources/PDFs' \\
+        --owner-note '<vault>/Articles/Old_Slug_2025.md' \\
+        --old-slug Old_Slug_2025 --new-slug New_Slug_2026 \\
+        --new-owner-note '<vault>/Articles/New_Slug_2026.md'
+    python3 fetch_images.py rename --phase finalize [--dry-run] \\
+        --attachments '<vault>/Sources/Images' --sources '<vault>/Sources/PDFs' \\
+        --owner-note '<vault>/Articles/Old_Slug_2025.md' \\
+        --old-slug Old_Slug_2025 --new-slug New_Slug_2026 \\
+        --new-owner-note '<vault>/Articles/New_Slug_2026.md'
+    python3 fetch_images.py dependencies --attachments '<vault>/Sources/Images' \\
+        --owner-note '<vault>/Articles/Old_Slug_2025.md' \\
+        --old-slug Old_Slug_2025
+    python3 fetch_images.py preflight --vault '<vault>' --slug Proposed_Slug_2026
+    python3 fetch_images.py selftest        # the built-in cases; offline
+
+`fetch` and `place` are the two halves of a figure this skill does not download
+as an image: a Lottie animation, which arrives as JSON and has to be
+rendered to a GIF by something else first. `fetch` brings the source down under
+the transport guards below, to a path OUTSIDE the vault; you render; `place`
+moves the result in under the write guards below. Neither the fetch nor the
+final write is left to the rendering step, because a script that does its own
+`urlopen` and its own `os.replace` into Sources/Images has none of this.
+
+`rename` requires an explicit phase. A changed-slug reprocess first uses
+`publish-note` to publish the reviewed draft against the old note's
+`publish_files.py snapshot` record, never a fresh snapshot. A free destination
+recorded `absent` gets the draft through `atomic_move.publish_new` with the old
+note's recorded mode, leaving the old note in place. It refuses a changed old
+note, an occupied destination, a draft with another web origin, an old note
+with only a legacy scalar `source:` and every old-note image blocker that
+`prepare` would raise. It also refuses a new slug that differs from the old
+one only by case or Unicode normalization: that note keeps its spelling and
+takes a same-name rewrite. It changes no image. Before the note, it writes
+`Articles/.<new_slug>.handoff.json` naming the old and the new note; the
+pair reads the same both ways, so every later phase refuses the swapped
+pair while that old note exists. Then `prepare` publishes
+verified new-name copies while
+retaining the old names, `repair` points every other note's references at the
+new names, and `finalize` runs only after an unchanged re-probe passes. Every
+image phase requires the old and new published owner notes. `repair` rewrites, in each other vault note, only the
+parsed links, embeds, Markdown and HTML targets that resolve to the old note
+or a mapped old image; it keeps each path form, label, anchor, size and alt
+text, edits no owner note, no dated `Investments/` research record and no
+other text, and reports every note it cannot rewrite unambiguously as a
+remaining blocker. The one other edit drops a `sources:` block-list item that
+the rewrite made a copy of another item, since one document is cited once.
+A same-note re-stem passes one renamed `Articles/<new_slug>.md` as both owner
+notes for images a rename left under the old stem. It applies only while no
+`Articles/<old_slug>.md` exists. Prepare requires every old-stem image to be
+that note's exact rendered embed; repair rewrites other notes' old image
+references only; finalize requires the republished note to embed the mapped
+new names instead, and `dependencies --new-slug` re-probes.
+
+The `--sources` every image phase requires is the vault's `Sources/PDFs`: a
+`<old_slug>.pdf` found anywhere beneath (the folder is recursive — book chapters live in
+`Sources/PDFs/<Work>/`) proves the figures under that stem are that document's,
+and the whole rename is refused. PDF manifest ownership is checked regardless
+of this inventory. Label spelling alone cannot distinguish a PDF's plain-numbered
+figures from a clipping's, so a rename never runs without the inventory.
+
+URLs are processed in the order given, which must be the body's source order:
+the figure counter is shared and sequential. Positional URLs are numbered
+before `--urls-file` lines. `--start` continues the counter when the note
+already has embeds (a figure recovered by the completeness audit, SKILL.md
+step 5, takes the next free number, not a number matching its position).
+`stage` needs a new or empty `--out-dir` for every call.
+
+Guards, because this is the only script in the skill that writes into the vault:
+
+* **Slugs are validated, paths are contained.** A slug holding `/`, `\\`, `..`,
+  or nothing at all is rejected, and every final path is checked to be under
+  the Sources/Images folder before anything is moved or renamed. `--slug` is free
+  text from the model, not necessarily what `slug.py` returned.
+* **Neither `place` nor a rename phase clobbers.** `prepare` exclusively
+  publishes byte-identical new-name copies and retains every old name;
+  `finalize` conditionally retires only its verified old duplicates. An
+  unexpected destination is an error (`--dry-run` reports it too).
+  Publication, retirement and every rollback
+  are conditional, so a path claimed after the plan is preserved and any mixed
+  state is reported for inspection.
+  `place` (and `stage`, in its scratch folder) refuses an occupied
+  `<slug>_fig_<N>.*` slot the same way — `shutil.move` replaces silently, so a
+  re-run with the wrong `--start` destroyed figures with no way back. No
+  clipping-clean workflow replaces an existing attachment: a reprocess keeps
+  existing figures, and a new or reformatted figure takes the next free number.
+  `place --overwrite` remains only as a guarded low-level capability; its
+  `--owner-note` must name the unchanged clipping note whose rendered embed
+  exactly names the file being replaced.
+  A legacy wiki-add research extract (body opening with
+  `<!-- obsidian:wiki-add-research-source -->`) never authorizes
+  `--overwrite` or either rename phase. wiki-add creates no extracts and
+  places no images, so no caller places images for one; a non-overwrite
+  placement it owns is still accepted as legacy behaviour.
+* **A changed clipping stem has no hidden dependants.** For a canonical vault,
+  `rename` inventories every other Markdown note and Obsidian Canvas board
+  (file cards, group backgrounds and text cards, read with pdf-organize's
+  canvas parser) for inbound old-note links and old-image references before
+  and during the operation. `prepare` reports those
+  dependencies while keeping both names resolvable; an incomplete scan still
+  blocks it. `repair` snapshots each dependent before reading it and replaces
+  it only while it still matches that snapshot. `finalize` refuses any
+  dependency or incomplete scan with exact blocker paths. `dependencies`
+  repeats that complete check before the old Articles path is retired.
+* **Only `http`, `https` and `data:`** — generic URL clients also speak `file:`
+  and `ftp:`, and clipped markdown legitimately carries `file://` image links.
+  Each HTTP(S) hop is resolved once, every answer is checked, and the actual
+  socket is pinned to that vetted address while the logical hostname remains in
+  Host and TLS SNI/certificate checks. Redirects repeat the process before any
+  target body is read. Loopback, link-local and private ranges are refused
+  unless `--allow-private-hosts`.
+* **Direct connections only** — ambient proxy settings are not used. Letting a
+  forward proxy resolve the logical hostname would recreate the DNS-rebinding
+  gap after local validation. Run this helper where direct egress is available;
+  `--allow-private-hosts` changes the address policy, not the proxy policy.
+* **Bounded downloads** — `--max-bytes` (25 MB default) and `--max-seconds`
+  (120 s default, wall-clock across the whole transfer, unlike the per-socket
+  `--timeout`), so a huge or slow-dripping response can't fill the vault.
+* **Non-images are failures, not `.png`s, and the BYTES decide that.** A
+  JSON/text/PDF error body is reported failed — naming what the bytes looked
+  like — so the model writes the documented
+  `<!-- image download failed: [redacted source locator] -->` placeholder
+  instead of embedding a file that Obsidian can't render. A `Content-Type` is
+  only a hint: an
+  `image/png` header on a JSON body does not make it an image, and used to.
+  SVG is accepted only when the complete file is inert and self-contained
+  and its root carries the SVG namespace; active elements, event handlers,
+  XML DTDs, and external resources are refused before publication. TIFF and
+  ICO are images Obsidian does not display: `stage` keeps one in scratch with
+  `needs_conversion: "png"` and `ok: false`, and `place` refuses one.
+
+Importable
+    sniff_extension(head, content_type=None, url=None) -> str | None
+    describe_bytes(head) -> str                        # "a JSON body", "a PDF", …
+    check_url(url, allow_private=False) -> None        # raises ValueError
+    download_one(url, attachments, slug, index, owner_note=None) -> dict
+                                                       # `stage`'s transport
+    fetch_source(url, out=None) -> dict                # Lottie source, outside vault
+    place_file(src, attachments, slug, index, owner_note=None) -> dict
+    slug_occupancy(vault, slug) -> dict                # `preflight`
+    prepare_slug_rename(attachments, old_slug, new_slug, *, sources=...,
+                        owner_note=..., new_owner_note=..., dry_run=False) -> dict
+    repair_slug_rename(attachments, old_slug, new_slug, *, sources=...,
+                       owner_note=..., new_owner_note=..., dry_run=False) -> dict
+    finalize_slug_rename(attachments, old_slug, new_slug, *, sources=...,
+                         owner_note=..., new_owner_note=..., dry_run=False) -> dict
+    publish_clipping_note(vault, snapshots, draft, old_slug, new_slug, *,
+                          owner_note=..., new_owner_note=...,
+                          dry_run=False) -> dict           # `publish-note`
+    dependency_status(attachments, owner_note, old_slug, new_slug=None) -> dict
+    validate_slug(slug, what="--slug") -> str          # raises ValueError
+    validate_index(index, what="figure index") -> int  # raises ValueError
+    run_self_test() -> int                             # also `selftest`
+
+Output: one JSON object on stdout. Exit 0 if every item succeeded, 1 if any
+failed (the JSON lists which). Stdlib only.
+"""
+
+import argparse
+import base64
+import binascii
+import contextlib
+import errno
+import fnmatch
+import glob
+import hashlib
+import http.client
+import io
+import ipaddress
+import json
+import math
+import os
+import re
+import shutil
+import socket
+import ssl
+import stat
+import sys
+import tempfile
+import time
+import unicodedata
+import urllib.error
+import urllib.parse
+import warnings
+import xml.etree.ElementTree as ET
+import zipfile
+
+_OBSIDIAN_SHARED_MODULES = (
+    "atomic_move", "entry_structure", "figure_state", "markdown_tables",
+    "portable_names", "publish_files", "slugify", "yaml_scalars")
+
+# --- obsidian shared-layer bootstrap (canonical; see shared/RUNTIME.md) ---
+import os as _os, sys as _sys
+_here = _os.path.dirname(_os.path.realpath(__file__))
+_required = tuple(_m + ".py" for _m in (
+    globals().get("_OBSIDIAN_SHARED_MODULES") or ("slugify",)))
+_env = _os.environ.get("OBSIDIAN_VAULT_SHARED")
+if _env:                                   # explicit override: authoritative, no fallback
+    _tried = [_os.path.abspath(_os.path.expanduser(_env))]
+else:                                      # plugin-relative walk-up, at most 5 levels
+    _tried, _d = [], _here
+    for _ in range(5):
+        _tried.append(_os.path.join(_d, "shared", "scripts"))
+        _d = _os.path.dirname(_d)
+    _tried.append(_here)                   # extracted skill with co-located helpers
+_missing = {_p: [_m for _m in _required if not _os.path.isfile(_os.path.join(_p, _m))]
+            for _p in _tried if _os.path.isdir(_p)}
+_shared = next((_p for _p in _tried if _p in _missing and not _missing[_p]), None)
+if _shared is None:
+    raise SystemExit("""obsidian: cannot find the plugin's shared/scripts/ folder, which holds
+the one canonical copy of the conventions this script depends on. A usable
+folder must contain these required module(s): %s
+Looked for:
+  %s
+Fix: install the whole plugin tree, or set OBSIDIAN_VAULT_SHARED to the
+shared/scripts/ directory (unset it to use the plugin-relative walk-up).
+Do NOT paste a second copy of the algorithm into this skill -- a divergent
+copy is the bug the shared layer exists to prevent.""" % (
+    ", ".join(_required), "\n  ".join(
+        _p + (" (not a directory)" if _p not in _missing else
+              " (missing: %s)" % ", ".join(_missing[_p]))
+        for _p in _tried)))
+_sys.path[:] = [_p for _p in _sys.path if _p not in (_shared, _here)]
+_sys.path.insert(0, _shared)               # shared/scripts/ FIRST
+if _here != _shared:
+    _sys.path.insert(1, _here)              # sibling modules before unrelated paths
+# --- end bootstrap ---
+
+from atomic_move import (LinkUnavailable, PublicationConflict,
+                         file_identity, link_noreplace,
+                         move_noreplace, regular_file_snapshot, remove_expected,
+                         replace_expected, publish_new, set_private_mode)
+import publish_files
+from dedup_index import (is_research_extract_text, normalize_url, read_source,
+                         split_frontmatter)
+from figure_state import MANIFEST_FILE, read_manifest
+from yaml_scalars import parse_scalar, parse_source_fields, yaml_lines
+from entry_structure import mask_body_comments
+
+
+def _name_key(name):
+    # Do not use casefold here. Expansions such as `ß` -> `ss` are one name on
+    # the default macOS volume but two legitimate names on a case-sensitive
+    # Linux volume. Filesystem identity below settles the expansion only where
+    # the active filesystem itself treats the spellings as equivalent.
+    return unicodedata.normalize("NFC", name).lower()
+
+
+def _manifest_name_key(name):
+    """Conservative identity for ownership records, including absent files."""
+    return unicodedata.normalize("NFC", name).casefold()
+
+
+def _same_directory_name(directory, actual_name, wanted_name):
+    """Whether two spellings resolve to one directory entry on this filesystem."""
+    if _name_key(actual_name) == _name_key(wanted_name):
+        return True
+    try:
+        return os.path.samefile(os.path.join(directory, actual_name),
+                                os.path.join(directory, wanted_name))
+    except OSError:
+        return False
+
+
+def _inside_existing_directory(path, directory, *, require_all=False):
+    """Whether an existing path is physically beneath an existing directory.
+
+    Textual ``realpath`` prefixes are not filesystem identity. On a default
+    APFS volume, two differently-cased spellings can name the same directory
+    while ``realpath`` preserves the caller's spelling. The old place guard
+    consequently accepted an attachment passed through the other spelling and
+    later removed that live vault entry as its scratch source. Compare ancestor
+    directory identities instead, considering both the logical entry path and
+    a symlink-resolved source. Any unreadable identity fails closed.
+    """
+    try:
+        wanted = os.stat(directory)
+    except FileNotFoundError:
+        return False
+    except OSError as exc:
+        raise ValueError("cannot identify the attachments folder %r safely: %s" %
+                         (directory, exc)) from exc
+    if not stat.S_ISDIR(wanted.st_mode):
+        raise ValueError("attachments path is not a directory: %r" % directory)
+    wanted_id = (wanted.st_dev, wanted.st_ino)
+
+    starts = [os.path.dirname(os.path.abspath(path))]
+    resolved = os.path.dirname(os.path.realpath(path))
+    if resolved not in starts:
+        starts.append(resolved)
+    results = []
+    for start in starts:
+        current = start
+        seen = set()
+        inside = False
+        while True:
+            try:
+                item = os.stat(current)
+            except OSError as exc:
+                raise ValueError("cannot establish whether %r is inside %r: %s" %
+                                 (path, directory, exc)) from exc
+            identity = (item.st_dev, item.st_ino)
+            if identity == wanted_id:
+                inside = True
+                break
+            if identity in seen:
+                raise ValueError("directory identity loop while checking whether %r "
+                                 "is inside %r" % (path, directory))
+            seen.add(identity)
+            parent = os.path.dirname(current)
+            if parent == current:
+                break
+            current = parent
+        results.append(inside)
+        if inside and not require_all:
+            return True
+    return all(results) if require_all else any(results)
+
+
+def _at_or_inside_existing_directory(path, directory):
+    """Whether ``path`` is ``directory`` itself or physically beneath it.
+
+    ``_inside_existing_directory`` starts at a path's parent because most
+    callers pass a prospective file.  Scratch-directory gates also have to
+    reject the vault root itself, including a symlink alias of that root.
+    """
+    if _inside_existing_directory(path, directory):
+        return True
+    try:
+        return os.path.samefile(path, directory)
+    except FileNotFoundError:
+        return False
+    except OSError as exc:
+        raise ValueError("cannot establish whether %r is the directory %r: %s" %
+                         (path, directory, exc)) from exc
+
+
+def _figure_stem_end(attachments, filename, slug, tail_pattern):
+    """End offset of ``slug`` in a matching figure basename, or None.
+
+    The suffix supplies a real directory entry for ``samefile``. This lets a
+    case-folding filesystem confirm an expansion such as Straße/STRASSE without
+    imposing that expansion on case-sensitive filesystems.
+    """
+    pattern = _name_key(tail_pattern)
+    for i, char in enumerate(filename):
+        if char != "_":
+            continue
+        suffix = filename[i:]
+        if not fnmatch.fnmatchcase(_name_key(suffix), pattern):
+            continue
+        if _same_directory_name(attachments, filename, slug + suffix):
+            return i
+    return None
+
+
+def _glob_slug(attachments, slug, tail):
+    """Match the flat folder using the vault's case/Unicode name identity.
+
+    Python glob compares directory entries case-sensitively even on macOS.
+    Scanning the literal directory also keeps brackets in a vault path from
+    being interpreted as a glob expression.
+    """
+    try:
+        with os.scandir(attachments) as entries:
+            return sorted(entry.path for entry in entries
+                          if _figure_stem_end(attachments, entry.name, slug, tail)
+                          is not None)
+    except FileNotFoundError:
+        return []
+
+UA = ("Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
+      "(KHTML, like Gecko) Chrome/124.0 Safari/537.36")
+
+ALLOWED_SCHEMES = {"http", "https", "data"}
+DEFAULT_MAX_BYTES = 25 * 1024 * 1024
+DEFAULT_MAX_SECONDS = 120
+MAX_REDIRECTS = 10
+REDIRECT_STATUSES = frozenset((301, 302, 303, 307, 308))
+CHUNK = 64 * 1024
+
+# Ambient HTTP(S) proxies are deliberately not consulted. A forward proxy that
+# receives the logical hostname can resolve it again after this process vets
+# DNS, recreating the exact rebinding gap this transport closes. Supporting a
+# proxy safely would require pinning the proxy connection *and* defining a
+# protocol that makes the proxy connect to the vetted target address while the
+# origin Host/SNI stay unchanged. The stdlib proxy path makes no such promise,
+# so this helper is direct-only instead of silently weakening its address guard.
+
+
+def _report_url(url, limit=200):
+    """Return a useful URL locator without echoing credentials or payloads.
+
+    Image URLs commonly carry expiring signatures in their query strings, and
+    a ``data:`` URL contains the image itself. The raw capture remains the
+    recovery record, so JSON results and note placeholders need only enough
+    information to identify which source failed. Fragments never reach the
+    server and are omitted as well.
+    """
+    raw = str(url or "")
+    try:
+        parts = urllib.parse.urlsplit(raw)
+    except (TypeError, ValueError):
+        match = re.match(r"\A([A-Za-z][A-Za-z0-9+.-]*):", raw)
+        value = ((match.group(1).lower() + ":") if match else "URL:") \
+            + "<location omitted>"
+        return value[:limit]
+
+    scheme = parts.scheme.lower()
+    if scheme == "data":
+        metadata = raw[5:].split(",", 1)[0]
+        metadata = "".join(
+            char if 0x20 <= ord(char) < 0x7f else "?" for char in metadata)
+        value = "data:" + metadata[:80] + ",<payload omitted>"
+        return value[:limit]
+    if scheme in ("http", "https") and parts.hostname:
+        host = parts.hostname
+        if ":" in host and not host.startswith("["):
+            host = "[" + host + "]"
+        try:
+            explicit_port = parts.port
+        except ValueError:
+            explicit_port = None
+        authority = host + ((":" + str(explicit_port))
+                            if explicit_port is not None else "")
+        path = parts.path or "/"
+        path = "".join(char if ord(char) >= 0x20 and ord(char) != 0x7f else "?"
+                       for char in path)
+        query = "?<query omitted>" if "?" in raw.split("#", 1)[0] else ""
+        value = scheme + "://" + authority + path + query
+        return value[:limit] + ("…" if len(value) > limit else "")
+    value = (scheme + ":" if scheme else "URL:") + "<location omitted>"
+    return value[:limit]
+
+#: Every canonical extension this producer can return. CONVENTIONS.md §8a
+#: publishes the same set; the convention harness compares them and verifies
+#: wiki-lint recognizes every one as an image embed.
+OUTPUT_EXTENSIONS = frozenset((
+    "png", "jpg", "gif", "webp", "svg", "avif", "bmp",
+))
+
+#: Recognized image formats that Obsidian does not display. `stage` keeps such
+#: a download in scratch and reports it for conversion to PNG; `place` refuses
+#: it, so it never reaches Sources/Images.
+CONVERT_EXTENSIONS = frozenset(("tiff", "ico"))
+
+#: Control characters that appear in ordinary text. Anything else below 0x20,
+#: plus DEL, means the payload is binary and the text branch does not apply.
+_TEXT_CTRL = {0x09, 0x0a, 0x0b, 0x0c, 0x0d, 0x1b}
+
+#: Leading byte patterns that are definitely NOT an image, with the name to put
+#: in the failure message. Consulted only once the magic-byte pass has found no
+#: image, so nothing here can shadow a real format.
+_NOT_IMAGE_MAGIC = (
+    (b"%PDF-", "a PDF"),
+    (b"%!PS", "a PostScript document"),
+    (b"PK\x03\x04", "a ZIP archive (or a zipped Office/OpenDocument file)"),
+    (b"PK\x05\x06", "an empty ZIP archive"),
+    (b"PK\x07\x08", "a spanned ZIP archive"),
+    (b"\x7fELF", "an ELF executable"),
+    (b"MZ", "a DOS/Windows executable"),
+    (b"\xca\xfe\xba\xbe", "a Java class or Mach-O fat binary"),
+    (b"\xcf\xfa\xed\xfe", "a Mach-O binary"),
+    (b"\xce\xfa\xed\xfe", "a 32-bit Mach-O binary"),
+    (b"\x1f\x8b", "a gzip stream"),
+    (b"BZh", "a bzip2 stream"),
+    (b"\xfd7zXZ\x00", "an xz stream"),
+    (b"\x28\xb5\x2f\xfd", "a zstd stream"),
+    (b"Rar!\x1a\x07", "a RAR archive"),
+    (b"7z\xbc\xaf\x27\x1c", "a 7-Zip archive"),
+    (b"\xd0\xcf\x11\xe0", "a legacy Office document"),
+    (b"SQLite format 3\x00", "a SQLite database"),
+    (b"OggS", "an Ogg media stream"),
+    (b"\x1aE\xdf\xa3", "a Matroska/WebM media stream"),
+    (b"ID3", "an MP3 audio stream"),
+    (b"fLaC", "a FLAC audio stream"),
+    (b"\x00asm", "a WebAssembly module"),
+)
+
+#: An SVG root element, once the prolog has been stepped over.
+_SVG_ROOT_RE = re.compile(r"<svg([\s>/]|$)", re.I)
+_SVG_NAMESPACE = "http://www.w3.org/2000/svg"
+_SVG_ACTIVE_ELEMENTS = frozenset((
+    "animate", "animatecolor", "animatemotion", "animatetransform",
+    "audio", "discard", "embed", "fencedframe", "foreignobject", "frame",
+    "handler", "iframe", "img", "link", "listener", "meta", "object",
+    "portal", "script", "set", "source", "track", "video",
+))
+_SVG_EXTERNAL_ATTRIBUTES = frozenset(("base", "href", "poster", "src"))
+_SVG_CSS_VALUE_ATTRIBUTES = frozenset((
+    "background", "background-image", "border-image", "border-image-source",
+    "clip-path", "color-profile", "content", "cursor", "fill", "fill-image",
+    "filter",
+    "list-style", "list-style-image", "marker", "marker-end", "marker-mid",
+    "marker-start", "mask", "mask-border", "mask-border-source", "mask-image",
+    "offset", "offset-path", "shape-inside", "shape-outside",
+    "shape-subtract", "stroke", "stroke-image", "style",
+))
+_SVG_CSS_RESOURCE_FUNCTIONS = (
+    "-webkit-image-set", "image-set", "image", "attr", "src",
+)
+
+
+def _xml_name(name):
+    """Return ``(namespace, local-name)`` for an ElementTree name."""
+    if name.startswith("{") and "}" in name:
+        namespace, local = name[1:].split("}", 1)
+        return namespace, local
+    return "", name
+
+
+def _css_without_comments(css):
+    """Remove CSS comments without treating comment markers in strings as syntax."""
+    out = []
+    index = 0
+    quote = None
+    while index < len(css):
+        char = css[index]
+        if quote is not None:
+            out.append(char)
+            if char == "\\" and index + 1 < len(css):
+                index += 1
+                out.append(css[index])
+            elif char == quote:
+                quote = None
+            index += 1
+            continue
+        if char in ("'", '"'):
+            quote = char
+            out.append(char)
+            index += 1
+            continue
+        if css.startswith("/*", index):
+            end = css.find("*/", index + 2)
+            if end < 0:
+                return None
+            index = end + 2
+            continue
+        out.append(char)
+        index += 1
+    return "".join(out)
+
+
+def _css_reference_issue(css):
+    """Return a reason when CSS can load anything beyond a local fragment.
+
+    This is deliberately a small deny parser, not a CSS sanitizer. Comments are
+    removed before tokens are inspected, strings outside functions are skipped,
+    and escapes in identifiers or ``url()`` arguments are refused because they
+    can spell an external locator without leaving a literal ``url(http...)``.
+    Resource-capable ``image()``, ``image-set()`` and ``src()`` functions, and
+    typed ``attr()`` values that can become URLs, are refused conservatively;
+    unlike ``url()``, their arguments are not reliably distinguishable from
+    inert strings with this small parser. Empty and fragment-only URL functions
+    remain self-contained.
+    """
+    css = _css_without_comments(str(css))
+    if css is None:
+        return "malformed CSS comments"
+    index = 0
+    while index < len(css):
+        char = css[index]
+        if char in ("'", '"'):
+            quote = char
+            index += 1
+            while index < len(css):
+                if css[index] == "\\":
+                    index += 2
+                    continue
+                if css[index] == quote:
+                    index += 1
+                    break
+                index += 1
+            else:
+                return "malformed CSS string"
+            continue
+        if char == "\\":
+            return "an escaped CSS token"
+        if css[index:index + 7].casefold() == "@import":
+            return "a CSS import"
+        if re.match(
+                r"@(?:-[A-Za-z0-9_]+-)?keyframes\b", css[index:], re.I):
+            return "a CSS animation"
+        previous = index - 1
+        while previous >= 0 and css[previous].isspace():
+            previous -= 1
+        if previous < 0 or css[previous] in ("{", ";"):
+            active_property = re.match(
+                r"(?:-[A-Za-z0-9_]+-)?(?:animation|transition)"
+                r"(?:-[A-Za-z0-9_-]+)?\s*:", css[index:], re.I)
+            if active_property:
+                return "a CSS animation or transition"
+        for function_name in _SVG_CSS_RESOURCE_FUNCTIONS:
+            if css[index:index + len(function_name)].casefold() != function_name:
+                continue
+            if index and (css[index - 1].isalnum()
+                          or css[index - 1] in ("_", "-")):
+                continue
+            cursor = index + len(function_name)
+            while cursor < len(css) and css[cursor].isspace():
+                cursor += 1
+            if cursor < len(css) and css[cursor] == "(":
+                return "a CSS resource function"
+        if css[index:index + 3].casefold() != "url":
+            index += 1
+            continue
+        cursor = index + 3
+        while cursor < len(css) and css[cursor].isspace():
+            cursor += 1
+        if cursor >= len(css) or css[cursor] != "(":
+            index += 3
+            continue
+        cursor += 1
+        while cursor < len(css) and css[cursor].isspace():
+            cursor += 1
+        if cursor < len(css) and css[cursor] in ("'", '"'):
+            quote = css[cursor]
+            cursor += 1
+            start = cursor
+            while cursor < len(css) and css[cursor] != quote:
+                if css[cursor] == "\\":
+                    return "an escaped CSS URL"
+                cursor += 1
+            if cursor >= len(css):
+                return "a malformed CSS URL"
+            target = css[start:cursor].strip()
+            cursor += 1
+            while cursor < len(css) and css[cursor].isspace():
+                cursor += 1
+            if cursor >= len(css) or css[cursor] != ")":
+                return "a malformed CSS URL"
+        else:
+            start = cursor
+            while cursor < len(css) and css[cursor] != ")":
+                if css[cursor] in ("\\", "'", '"'):
+                    return "an escaped or malformed CSS URL"
+                cursor += 1
+            if cursor >= len(css):
+                return "a malformed CSS URL"
+            target = css[start:cursor].strip()
+        if target and not target.startswith("#"):
+            return "an external CSS URL"
+        index = cursor + 1
+    return None
+
+
+def _xml_directive_issue(text):
+    """Detect DTDs/stylesheets outside comments and CDATA before XML parsing."""
+    index = 0
+    while True:
+        index = text.find("<", index)
+        if index < 0:
+            return None
+        if text.startswith("<!--", index):
+            end = text.find("-->", index + 4)
+            if end < 0:
+                return "malformed XML comment"
+            index = end + 3
+            continue
+        if text.startswith("<![CDATA[", index):
+            end = text.find("]]>", index + 9)
+            if end < 0:
+                return "malformed XML CDATA"
+            index = end + 3
+            continue
+        if text.startswith("<?", index):
+            end = text.find("?>", index + 2)
+            if end < 0:
+                return "malformed XML processing instruction"
+            if re.match(r"<\?xml-stylesheet\b", text[index:end + 2], re.I):
+                return "an external XML stylesheet"
+            index = end + 2
+            continue
+        if re.match(r"<!DOCTYPE\b", text[index:], re.I):
+            return "an XML DOCTYPE"
+        index += 1
+
+
+def _decode_text(head):
+    """`head` as text when the bytes plausibly ARE text, else None.
+
+    The split matters because **the only text-shaped image format is SVG**: a
+    payload that decodes as text and is not an SVG is not an image, whatever
+    the Content-Type claims. JSON error bodies, plain-text 404s and HTML block
+    pages all land here, including the spellings that used to slip past a
+    `startswith` probe (a UTF-8 BOM, a leading comment, leading blank lines).
+
+    A real image's first bytes carry NULs or other C0 control bytes within the
+    first few hundred, so no raster format reaches this branch by accident.
+    """
+    if not head:
+        return None
+    chunk = head
+    # a fixed-size window can cut a multi-byte character in half; back off up
+    # to three bytes before concluding the payload is not UTF-8 at all.
+    for _ in range(4):
+        try:
+            text = chunk.decode("utf-8")
+            break
+        except UnicodeDecodeError:
+            chunk = chunk[:-1]
+            if not chunk:
+                return None
+    else:
+        return None
+    for ch in text:
+        code = ord(ch)
+        if (code < 0x20 and code not in _TEXT_CTRL) or code == 0x7f:
+            return None
+    return text
+
+
+def _is_svg_text(text):
+    """Is the ROOT ELEMENT of this text `<svg>`?
+
+    How SVG is validated, deliberately: an SVG is text, so there are no magic
+    bytes to trust and something has to stand in for them. The rule chosen is
+    *the root element must be `svg`* — step over a BOM, whitespace, an XML
+    declaration or processing instruction, comments and a DOCTYPE, then require
+    the first real element to be `<svg`. The looser "starts with `<?xml` and
+    contains `<svg` somewhere" test this replaces accepted an XHTML page with an
+    inline icon, an RSS feed with an SVG logo, and any HTML block page a CDN
+    prefixed with a comment — all of which then landed in the vault as `.svg`.
+    Anything truncated mid-prolog is not an SVG here: no verdict means no write.
+    """
+    s = text.lstrip("\ufeff").lstrip()
+    while s[:1] == "<" and s[1:2] in ("?", "!"):
+        if s.startswith("<!--"):
+            end, skip = s.find("-->"), 3
+        elif s.startswith("<?"):
+            end, skip = s.find("?>"), 2
+        else:                            # <!DOCTYPE …>, <![CDATA[…
+            # A DOCTYPE may contain an internal subset with declarations
+            # whose own ``>`` characters do not close the DOCTYPE. Scan to
+            # the first unquoted ``>`` outside square brackets; no entity is
+            # expanded or otherwise interpreted here.
+            end, depth, quote_char = -1, 0, None
+            for index, char in enumerate(s[2:], 2):
+                if quote_char is not None:
+                    if char == quote_char:
+                        quote_char = None
+                    continue
+                if char in ("'", '"'):
+                    quote_char = char
+                elif char == "[":
+                    depth += 1
+                elif char == "]" and depth:
+                    depth -= 1
+                elif char == ">" and depth == 0:
+                    end = index
+                    break
+            skip = 1
+        if end < 0:
+            return False
+        s = s[end + skip:].lstrip()
+    return bool(_SVG_ROOT_RE.match(s))
+
+
+def _svg_safety_issue(text):
+    """Name active or external SVG content or a missing namespace, else ``None``.
+
+    A local SVG is displayed later by Obsidian/Electron, outside this helper's
+    process. Parse its XML structure instead of trying to sanitize markup with
+    regular expressions: character references and CDATA must be interpreted in
+    their actual context, while comments and text labels must not become false
+    element or CSS matches. Fragment-only references such as ``href="#marker"``
+    and ``url("#gradient")`` remain available for ordinary diagrams.
+    """
+    directive_issue = _xml_directive_issue(text)
+    if directive_issue:
+        return directive_issue
+    try:
+        root = ET.fromstring(text)
+    except (ET.ParseError, ValueError) as exc:
+        return "malformed XML (%s)" % exc
+    namespace, local = _xml_name(root.tag)
+    if local.casefold() != "svg" or namespace not in ("", _SVG_NAMESPACE):
+        return "a non-SVG root element or namespace"
+
+    for element in root.iter():
+        if not isinstance(element.tag, str):
+            continue
+        _namespace, local = _xml_name(element.tag)
+        local = local.casefold()
+        if local in _SVG_ACTIVE_ELEMENTS:
+            return "an active script, animation, or foreign element"
+        for raw_name, raw_value in element.attrib.items():
+            _attr_namespace, name = _xml_name(raw_name)
+            name = name.casefold()
+            value = str(raw_value)
+            if len(name) > 2 and name.startswith("on"):
+                return "an event-handler attribute"
+            if name in _SVG_EXTERNAL_ATTRIBUTES:
+                locator = value.strip()
+                if locator and not locator.startswith("#"):
+                    return "an external href, source, or base attribute"
+            if (name in ("animation", "transition")
+                    or name.startswith(("animation-", "transition-"))):
+                return "a CSS animation or transition attribute"
+            if name in _SVG_CSS_VALUE_ATTRIBUTES:
+                issue = _css_reference_issue(value)
+                if issue:
+                    return "an external CSS resource (%s)" % issue
+        if local == "style":
+            issue = _css_reference_issue("".join(element.itertext()))
+            if issue:
+                return "an external CSS resource (%s)" % issue
+    # Inline SVG in HTML may omit the namespace, but a standalone file without
+    # it is plain XML to Obsidian's Chromium and shows as a broken image.
+    if namespace != _SVG_NAMESPACE:
+        return ('a root <svg> without xmlns="%s", so it does not render as '
+                'an image; add it (and xmlns:xlink when xlink: attributes '
+                'are used) when serializing' % _SVG_NAMESPACE)
+    return None
+
+
+def _validate_svg_file(path, max_bytes=DEFAULT_MAX_BYTES):
+    """Require a bounded, complete, inert, self-contained UTF-8 SVG file."""
+    size = os.path.getsize(path)
+    if size > max_bytes:
+        raise ValueError(
+            "SVG exceeds the %d-byte safety cap" % max_bytes)
+    with open(path, "r", encoding="utf-8-sig", newline="") as source:
+        text = source.read()
+    if not _is_svg_text(text):
+        raise ValueError("SVG root could not be validated from the complete file")
+    issue = _svg_safety_issue(text)
+    if issue:
+        raise ValueError(
+            "refusing SVG with %s; only inert self-contained SVG is supported"
+            % issue)
+
+
+def _conversion_message(ext):
+    """Why a recognized TIFF or ICO image cannot be published as it is."""
+    return ("a %s image, which Obsidian does not display; convert it to PNG "
+            "in scratch, check it, and place the PNG at this index"
+            % ext.upper())
+
+
+def _image_magic(head):
+    """The image format these bytes actually are, or None. Bytes only.
+
+    Nothing here consults the Content-Type or the URL: this is the evidence
+    those two are checked against, not combined with.
+    """
+    if head[:8] == b"\x89PNG\r\n\x1a\n":
+        return "png"
+    if head[:3] == b"\xff\xd8\xff":
+        return "jpg"
+    if head[:6] in (b"GIF87a", b"GIF89a"):
+        return "gif"
+    if head[:4] == b"RIFF" and head[8:12] == b"WEBP":
+        return "webp"
+    # ISO-BMFF: only the AVIF brands are an image this skill writes. Every
+    # other brand (mp4, isom, heic) is a media container, and _binary_shape
+    # names it rather than letting the header call it a png.
+    if head[4:8] == b"ftyp" and len(head) >= 12:
+        size = int.from_bytes(head[:4], "big")
+        box_end = min(len(head), size) if size >= 12 else len(head)
+        brands = [head[8:12]]
+        brands.extend(head[index:index + 4]
+                      for index in range(16, box_end - 3, 4))
+        if any(brand in (b"avif", b"avis") for brand in brands):
+            return "avif"
+    if head[:2] == b"BM":
+        return "bmp"
+    if head[:4] in (b"II\x2a\x00", b"MM\x00\x2a"):
+        return "tiff"
+    if head[:4] == b"\x00\x00\x01\x00":
+        return "ico"
+    return None
+
+
+def _binary_shape(head):
+    """What these non-text, non-image bytes are, or None when unrecognized."""
+    for magic, name in _NOT_IMAGE_MAGIC:
+        if head.startswith(magic):
+            return name
+    if head[4:8] == b"ftyp":
+        brand = head[8:12].decode("ascii", "replace").strip()
+        return "an ISO media container (brand %r)" % brand
+    return None
+
+
+def describe_bytes(head):
+    """A short human name for what `head` looks like, for a failure message.
+
+    A refusal that says only "not an image" sends the reader back to the URL
+    with nothing to go on; naming the shape ("a JSON body", "an HTML page", "a
+    PDF") says whether the CDN returned an error document, a login wall or the
+    wrong file entirely.
+    """
+    named = _binary_shape(head)          # %PDF-/%!PS are text-shaped: check first
+    if named and head[:1] in (b"%",):
+        return named
+    ext = _image_magic(head)
+    if ext:
+        return "a %s image" % ext.upper()
+    text = _decode_text(head)
+    if text is not None:
+        s = text.lstrip("\ufeff").lstrip()
+        low = s.lower()
+        if _is_svg_text(text):
+            return "an SVG document"
+        if low.startswith("<!doctype html") or low.startswith("<html") \
+                or "<html" in low[:1024]:
+            return "an HTML page"
+        if s[:1] in "{[":
+            return "a JSON body"
+        if s[:1] == "<":
+            return "an XML or markup document"
+        return "plain text"
+    return named or "unrecognized binary data"
+
+
+def sniff_extension(head, content_type=None, url=None):
+    """Detect a supported image signature; headers and URL names cannot supply it.
+
+    Returns an extension, or None when the payload is not an image at all (an
+    HTML error page, a JSON error body, a PDF, a failed redirect — all treated
+    as a download failure).
+
+    The order is evidence first, claims second, and it is that way round because
+    a `Content-Type` is whatever the server chose to send. A mapped `image/*`
+    type used to win outright, so any JSON, text, PDF, ZIP, ELF or
+    comment-prefixed HTML body served as `Content-Type: image/png` was written
+    into `Sources/Images/` and reported `"ok": true` — the one thing this script
+    exists to prevent. So:
+
+    1. **Magic bytes win.** A recognized image signature is the answer, even
+       when the header disagrees (Substack serves webp under `.png` URLs).
+    2. **Bytes that are recognizably something else lose.** Text that is not an
+       SVG root, and the binary signatures in `_NOT_IMAGE_MAGIC`, are a failure
+       no header can rescue.
+    3. **Unrecognized bytes fail too.** Otherwise arbitrary binary data with an
+       image header or a .png URL is published as a successful image. Add a
+       byte signature for a new format instead of guessing its extension.
+
+    This is format identification, not a complete image decode. Visual review
+    must still check that a recognized image is intact and readable.
+
+    A failure here is what puts the documented `<!-- image download failed: … -->`
+    placeholder in the body; `describe_bytes` names the shape for the message.
+    """
+    text = _decode_text(head)
+    if text is not None:
+        # The only text-shaped image is SVG, and it has to be one at the root.
+        return "svg" if _is_svg_text(text) else None
+    ext = _image_magic(head)
+    if ext:
+        return ext
+    return None
+
+
+def _temp_path():
+    # No image extension, and outside Sources/Images on purpose: nothing half-written
+    # or wrongly-named must ever appear in the vault.
+    fd, path = tempfile.mkstemp(prefix="clipping_img.", suffix="")
+    os.close(fd)
+    return path
+
+
+def _stable_regular_snapshot(path, copy_to=None, copy_mode=None):
+    """Read one regular file consistently; optionally stage the same bytes.
+
+    The returned equality key intentionally omits ctime and link count: the
+    guarded publication protocol creates private hard links, which changes
+    those fields without changing the authorized content. They remain part of
+    the before/after read stability check.
+    """
+    path = os.path.abspath(path)
+    try:
+        before = os.lstat(path)
+    except OSError as exc:
+        raise OSError(errno.ENOENT, "%r is missing or unreadable (%s)" %
+                      (path, exc), path) from exc
+    if not stat.S_ISREG(before.st_mode):
+        raise OSError(errno.EINVAL, "%r is a symlink or non-regular file" % path,
+                      path)
+    flags = os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK
+    try:
+        descriptor = os.open(path, flags)
+    except OSError as exc:
+        raise OSError(getattr(exc, "errno", None) or errno.EIO,
+                      "%r changed or could not be opened safely (%s)" %
+                      (path, exc), path) from exc
+
+    digest = hashlib.sha256()
+    destination = None
+    created = None
+    try:
+        with os.fdopen(descriptor, "rb") as source:
+            opened_before = os.fstat(source.fileno())
+            if (not stat.S_ISREG(opened_before.st_mode)
+                    or file_identity(path) != (
+                        opened_before.st_dev, opened_before.st_ino,
+                        stat.S_IFMT(opened_before.st_mode))):
+                raise OSError(errno.EBUSY, "%r changed while it was opened" % path,
+                              path)
+            if copy_to is not None:
+                destination = open(copy_to, "xb")
+                opened_copy = os.fstat(destination.fileno())
+                created = (opened_copy.st_dev, opened_copy.st_ino,
+                           stat.S_IFMT(opened_copy.st_mode))
+            try:
+                while True:
+                    chunk = source.read(CHUNK)
+                    if not chunk:
+                        break
+                    digest.update(chunk)
+                    if destination is not None:
+                        destination.write(chunk)
+                if destination is not None:
+                    set_private_mode(destination, copy_mode)
+                    destination.flush()
+                    os.fsync(destination.fileno())
+                opened_after = os.fstat(source.fileno())
+            finally:
+                if destination is not None:
+                    destination.close()
+    except Exception:
+        # This pathname may predate our exclusive create or have been replaced
+        # by another writer. Leave it to the caller's owned-stage cleanup;
+        # failure must never unlink an unverified scratch occupant.
+        raise
+
+    try:
+        after = os.lstat(path)
+    except OSError as exc:
+        raise OSError(getattr(exc, "errno", None) or errno.EIO,
+                      "%r changed while it was read (%s)" % (path, exc),
+                      path) from exc
+    stable = lambda item: (
+        item.st_dev, item.st_ino, item.st_mode, item.st_size,
+        getattr(item, "st_mtime_ns", int(item.st_mtime * 1e9)),
+        getattr(item, "st_ctime_ns", int(item.st_ctime * 1e9)),
+    )
+    if not (stable(before) == stable(opened_before)
+            == stable(opened_after) == stable(after)):
+        raise OSError(errno.EBUSY,
+                      "%r changed while its bytes were copied" % path, path)
+    snapshot = (
+        (after.st_dev, after.st_ino, stat.S_IFMT(after.st_mode)),
+        digest.hexdigest(), stat.S_IMODE(after.st_mode), after.st_size,
+    )
+    if copy_to is not None:
+        staged = _stable_regular_snapshot(copy_to)
+        if staged[0] != created or (staged[1], staged[3]) != (snapshot[1], snapshot[3]):
+            raise OSError(errno.EIO, "staged bytes do not match %r" % path,
+                          copy_to)
+    return snapshot
+
+
+def _same_content(a, b):
+    """Two snapshots hold the same bytes; a permission mode is not content."""
+    return (a[1], a[3]) == (b[1], b[3])
+
+
+def _mask_html_literal_blocks(text, *, mask_unclosed=True):
+    """Blank raw HTML regions whose contents render as code or non-content."""
+    chars = list(text)
+    cursor = 0
+    opening = re.compile(r"<(pre|code|script|style)\b[^>]*>", re.IGNORECASE)
+    while True:
+        match = opening.search(text, cursor)
+        if match is None:
+            break
+        closing = re.compile(r"</%s\s*>" % re.escape(match.group(1)),
+                             re.IGNORECASE)
+        end_match = closing.search(text, match.end())
+        if end_match is None and not mask_unclosed:
+            cursor = match.end()
+            continue
+        stop = len(text) if end_match is None else end_match.end()
+        for index in range(match.start(), stop):
+            if chars[index] not in "\r\n":
+                chars[index] = " "
+        if end_match is None:
+            break
+        cursor = stop
+    return "".join(chars)
+
+
+def _rendered_embed_basenames(body):
+    """Return filename-only Obsidian image embeds outside code/comments.
+
+    A clipped article can quote ``![[name.png]]`` in prose, code, or comments.
+    Those strings are not rendered attachment references and cannot prove that
+    the note owns a same-named file. False negatives are intentional here: an
+    owner check may refuse and ask for inspection, but it must never take a
+    shared-folder file based on inert source text. Code spans come from the
+    shared paragraph-bounded lexer, so an unmatched backtick stays literal
+    text, as it renders. Blockquote and callout markers are stripped only
+    after that masking, so a quoted fence line shown inside an unquoted fence
+    cannot close it. Indentation is read from the source line, where a masked
+    code span or comment is not whitespace.
+    """
+    source = body or ""
+    visible = _mask_html_literal_blocks(
+        mask_body_comments(source, mask_code=True))
+    out = []
+    fence = None
+    previous = ""
+    offset = 0
+    for line in visible.splitlines(keepends=True):
+        # Masking keeps every offset, so this is the same line unmasked.
+        raw = source[offset:offset + len(line)]
+        offset += len(line)
+        # Code inside a blockquote or callout is still code.
+        quote = re.match(r"(?: {0,3}>[ ]?)*", line)
+        depth = quote.group(0).count(">")
+        line, raw = line[quote.end():], raw[quote.end():]
+        stripped = line.rstrip("\r\n")
+        if fence is not None:
+            close = re.match(r"([ \t]*)(%s{%d,})[ \t]*$" %
+                             (re.escape(fence[0]), fence[1]), stripped)
+            # Only a closer at the opener's quote depth ends the fence; a
+            # deeper "> ```" line is content shown inside it.
+            if (close and depth == fence[3]
+                    and len(close.group(1).expandtabs(4)) <= fence[2]):
+                fence = None
+            continue
+        # As in the shared lexer, any indentation opens a fence: in a quoted
+        # list continuation the fence sits four or more columns in.
+        opened = re.match(
+            r"((?:[ \t]*(?:[-*+]|\d{1,9}[.)])[ \t]+)*[ \t]*)(`{3,}|~{3,})",
+            stripped)
+        if opened:
+            marker = opened.group(2)
+            fence = (marker[0], len(marker),
+                     max(3, len(opened.group(1).expandtabs(4))), depth)
+            continue
+        # An indented list continuation renders; other indentation may be code.
+        if ((raw.startswith("\t") or raw.startswith("    "))
+                and not re.match(r" {0,3}(?:[-*+]|\d{1,9}[.)])(?:\s|$)|\s",
+                                 previous)):
+            continue
+        if stripped.strip():
+            previous = raw.rstrip("\r\n")
+        for match in re.finditer(r"(?<!\\)!\[\[([^\]\r\n]+)\]\]", line):
+            # An escaped pipe is the size separator in a table cell.
+            target = re.split(r"\\?\|", match.group(1), maxsplit=1)[0]
+            target = target.split("#", 1)[0].strip()
+            # The plugin's attachment convention is filename-only. Accepting
+            # a path-qualified target and reducing it to basename would let a
+            # reference to some other folder claim this shared flat namespace.
+            if (not target or "/" in target or "\\" in target
+                    or target in (".", "..")):
+                continue
+            out.append(target)
+    return frozenset(out)
+
+
+# An inline link or image destination, found from its `](`: link text may
+# hold brackets, and a linked image's outer target is a second match.
+_MARKDOWN_LINK_TARGET = re.compile(
+    r"\]\(\s*(?:<(?P<angle>[^>\r\n]+)>|(?P<plain>[^)\s\r\n]+))")
+# A definition may sit in a blockquote, callout or list item, or indented
+# under one.
+_MARKDOWN_REFERENCE_TARGET = re.compile(
+    r"^[ \t]*(?:(?:>[ \t]?)+[ \t]*|(?:[-*+]|\d{1,9}[.)])[ \t]+)*"
+    r"\[[^\]\r\n]+\]:[ \t]*(?:<(?P<angle>[^>\r\n]+)>|(?P<plain>\S+))",
+    re.MULTILINE)
+_HTML_REFERENCE_TARGET = re.compile(
+    r"\b(?:src|href)[ \t]*=[ \t]*"
+    r"(?:\"([^\"\r\n]+)\"|'([^'\r\n]+)'|([^\s\"'<>=`]+))",
+    re.IGNORECASE)
+#: An open tag from its ``<`` up to a src/href value or its opening quote, on
+#: one line. Repair rewrites an HTML-pattern target only behind this prefix.
+_HTML_ATTRIBUTE_PREFIX = re.compile(
+    r"<[A-Za-z][\w:-]*(?:[ \t]+[^\s\"'<>=/`]+(?:[ \t]*=[ \t]*"
+    r"(?:\"[^\"]*\"|'[^']*'|[^\s\"'<>=`]+))?)*[ \t]+(?:src|href)[ \t]*=[ \t]*"
+    r"[\"']?", re.IGNORECASE)
+
+
+#: List-marker indentation the dependency view flattens (see below).
+_LIST_MARKER_INDENT = re.compile(r"(?m)^[ \t]+(?=(?:[-*+]|\d{1,9}[.)])[ \t]+)")
+_WIKILINK_TARGET = re.compile(r"(?<!\\)!?\[\[([^\]\r\n]+)\]\]")
+#: A fence opened after blockquote, callout or list-item markers. The shared
+#: lexer sees only unprefixed fences; the strict repair view masks these too.
+_CONTAINER_FENCE = re.compile(
+    r"((?:[ \t]*(?:>|(?:[-*+]|\d{1,9}[.)])[ \t]))+)[ \t]*(`{3,}|~{3,})(.*)$")
+#: A display-math delimiter: ``$$`` alone on its line. Obsidian renders the
+#: lines between two of them as math, never as links.
+_MATH_DELIMITER = re.compile(r"[ \t]*\$\$[ \t]*$")
+#: The same delimiter after blockquote, callout or list-item markers.
+_CONTAINER_MATH = re.compile(
+    r"((?:[ \t]*(?:>|(?:[-*+]|\d{1,9}[.)])[ \t]))+)[ \t]*\$\$[ \t]*$")
+#: Inline ``$...$`` math on one line (no space just inside either dollar, no
+#: digit after the closer, so prices stay prose) and ``$$...$$`` on one line.
+#: Only repair's strict view masks them.
+_INLINE_MATH = re.compile(
+    r"(?<![\\$])\$\$(?:\\.|[^$\n\\])+?\$\$"
+    r"|(?<![\\$])\$(?![\s$])(?:\\.|[^$\n\\])*?(?<![\s\\])\$(?![$\d])")
+
+
+def _visible_markdown(text, origin=None, strict=False):
+    """Mask literal/comment regions while retaining rendered link syntax.
+
+    A list passed as ``origin`` receives each view character's offset in
+    ``text``, so `rename --phase repair` can map a parsed target back to the
+    exact span it rewrites.
+
+    Both views mask a closed ``$$`` display-math block, as they mask a
+    fenced code block. The default view fails closed for retirement: an
+    unclosed comment, literal block or math delimiter stays visible, as does
+    a fence or math block behind container markers. ``strict`` is repair's
+    view instead: it masks each of those to its furthest possible end, so
+    text that may render as code, math or a comment is never rewritten.
+    It also masks inline ``$...$`` and one-line ``$$...$$`` math.
+    """
+    split = split_frontmatter(text)
+    prefix = text[:len(text) - len(split[1])] if split is not None else ""
+    body = text if split is None else split[1]
+    # A partial/existing MOC can begin with an indented list item. For this
+    # retirement inventory, indentation is never proof that such links are
+    # inert code; flatten only list-marker indentation in this read-only view.
+    if origin is None:
+        body = _LIST_MARKER_INDENT.sub("", body)
+    else:
+        origin.extend(range(len(prefix)))
+        kept, positions, cursor = [], [], 0
+        for match in _LIST_MARKER_INDENT.finditer(body):
+            kept.append(body[cursor:match.start()])
+            positions.extend(range(len(prefix) + cursor,
+                                   len(prefix) + match.start()))
+            cursor = match.end()
+        kept.append(body[cursor:])
+        positions.extend(range(len(prefix) + cursor, len(text)))
+        body = "".join(kept)
+    # YAML strings do not open Markdown comments. Keep their raw references
+    # visible, and use the shared code-aware lexer only for the body. An
+    # unresolved comment is not evidence that an old dependency disappeared.
+    visible = _mask_html_literal_blocks(mask_body_comments(
+        body, mask_code=True, mask_unclosed_comments=strict),
+        mask_unclosed=strict)
+    lines = visible.splitlines(keepends=True)
+    # The default view masks only a math block that a later delimiter closes.
+    last_math = max((index for index, line in enumerate(lines)
+                     if _MATH_DELIMITER.match(line.rstrip("\r\n"))),
+                    default=-1)
+    out = []
+    fence = boxed = None
+    end = 0
+    for index, line in enumerate(lines):
+        start, end = end, end + len(line)
+        stripped = line.rstrip("\r\n")
+        if (boxed is not None and boxed[2]
+                and not re.match(r"[ \t]*>", stripped)):
+            boxed = None  # a quoted fence ends with its blockquote
+        if boxed is not None:
+            # Only a closer at the opener's quote depth ends the fence.
+            close = re.match(r"[ \t]*((?:>[ \t]*)*)(%s{%d,})[ \t]*$" %
+                             (re.escape(boxed[0]), boxed[1]), stripped)
+            if close and close.group(1).count(">") == boxed[2]:
+                boxed = None
+            masked = True
+        elif fence is not None:
+            close = (_MATH_DELIMITER.match(stripped) if fence[0] == "$" else
+                     re.match(r" {0,3}(%s{%d,})[ \t]*$" %
+                              (re.escape(fence[0]), fence[1]), stripped))
+            if close:
+                fence = None
+            masked = True
+        else:
+            opened = re.match(r" {0,3}(`{3,}|~{3,})", stripped)
+            math = (not opened and _MATH_DELIMITER.match(stripped)
+                    and (strict or index < last_math))
+            boxed_open = strict and not opened and not math and (
+                _CONTAINER_FENCE.match(stripped)
+                or _CONTAINER_MATH.match(stripped))
+            if opened:
+                marker = opened.group(1)
+                fence = (marker[0], len(marker))
+            elif math:
+                fence = ("$", 2)
+            elif boxed_open and boxed_open.re is _CONTAINER_MATH:
+                boxed = ("$", 2, boxed_open.group(1).count(">"))
+            elif boxed_open and not (boxed_open.group(2)[0] == "`"
+                                     and "`" in boxed_open.group(3)):
+                marker = boxed_open.group(2)
+                boxed = (marker[0], len(marker),
+                         boxed_open.group(1).count(">"))
+            masked = fence is not None or boxed is not None
+        if masked:
+            newline = line.endswith(("\n", "\r"))
+            out.append("\n" if newline else "")
+            if origin is not None and newline:
+                origin.append(positions[end - 1])
+            continue
+        # Do not treat indentation as proof of a code block here. Obsidian's
+        # MOCs use nested list indentation of four or more spaces; dependency
+        # retirement must fail closed and see links in those list items.
+        if strict:
+            # Same-length blanks keep every ``origin`` offset.
+            line = _INLINE_MATH.sub(lambda m: " " * len(m.group()), line)
+        out.append(line)
+        if origin is not None:
+            origin.extend(positions[start:end])
+    return prefix + "".join(out)
+
+
+def _local_target_path(target, *, wikilink=False):
+    """Return a local Markdown target's decoded path, never a remote URL."""
+    target = str(target).strip()
+    if wikilink:
+        # An escaped pipe is still the display separator in an Obsidian table.
+        target = re.split(r"(?<!\\)\||\\\|", target, maxsplit=1)[0]
+        target = target.split("#", 1)[0].strip()
+    else:
+        target = target.strip("<>")
+        target = target.split("#", 1)[0].split("?", 1)[0]
+    if not target or target.startswith("//") \
+            or re.match(r"^[A-Za-z][A-Za-z0-9+.-]*:", target):
+        return None
+    try:
+        target = urllib.parse.unquote(target)
+    except (UnicodeError, ValueError):
+        return None
+    return target.replace("\\", "/").rstrip("/") or None
+
+
+def _local_target_basename(target, *, wikilink=False):
+    """Return the basename of a local Markdown target, never a remote URL."""
+    path = _local_target_path(target, wikilink=wikilink)
+    return path and (path.rsplit("/", 1)[-1].strip() or None)
+
+
+def _dependency_targets(text, spans=False, strict=False):
+    """Yield ``(target, wikilink, span, kind)`` for each rendered link target.
+
+    ``target`` is the text the masked view parses. With ``spans``, ``span``
+    is its exact ``(start, end)`` in ``text``, or None when masking or list
+    flattening changed a character inside it; otherwise it is None.
+    ``kind`` names the pattern that matched: ``wikilink``, ``markdown``,
+    ``definition`` (a reference-style link definition) or ``html``. ``strict`` parses `_visible_markdown`'s strict view.
+    """
+    origin = [] if spans else None
+    visible = _visible_markdown(text, origin, strict=strict)
+
+    def located(match, group):
+        if origin is None:
+            return None
+        start, end = match.span(group)
+        first, last = origin[start], origin[end - 1] + 1
+        if last - first != end - start or text[first:last] != visible[start:end]:
+            return None
+        return first, last
+
+    for match in _WIKILINK_TARGET.finditer(visible):
+        yield match.group(1), True, located(match, 1), "wikilink"
+    for pattern in (_MARKDOWN_LINK_TARGET, _MARKDOWN_REFERENCE_TARGET):
+        for match in pattern.finditer(visible):
+            group = "angle" if match.group("angle") else "plain"
+            yield (match.group(group), False, located(match, group),
+                   "markdown" if pattern is _MARKDOWN_LINK_TARGET
+                   else "definition")
+    for match in _HTML_REFERENCE_TARGET.finditer(visible):
+        group = next(n for n in (1, 2, 3) if match.group(n))
+        yield match.group(group), False, located(match, group), "html"
+
+
+def _dependency_classifier(image_names, old_slug, include_note=True):
+    """Return the old image or note name a parsed target names, or None."""
+    images = {_manifest_name_key(name): name for name in image_names}
+    note_key = _manifest_name_key(old_slug)
+
+    def classify(target, wikilink=False):
+        base = _local_target_basename(target, wikilink=wikilink)
+        if not base:
+            return None
+        image = images.get(_manifest_name_key(base))
+        if image is not None:
+            return image
+        # Match the whole name, not `splitext`: a slug may hold a dot
+        # (`Geron_ML_1.5_2024`), and `[[Geron_ML_1.5_2024]]` names its note.
+        if include_note and (
+                _manifest_name_key(base) == note_key
+                or (base[-3:].casefold() == ".md"
+                    and _manifest_name_key(base[:-3]) == note_key)):
+            return old_slug + ".md"
+        return None
+
+    return classify
+
+
+def _markdown_dependency_names(text, image_names, old_slug, include_note=True):
+    """Known old image/note targets referenced by rendered Markdown.
+
+    A same-note re-stem has no old note to retire, so it passes
+    ``include_note=False`` and only old image names are dependencies.
+    """
+    classify = _dependency_classifier(image_names, old_slug, include_note)
+    found = {classify(target, wikilink)
+             for target, wikilink, _span, _kind in _dependency_targets(text)}
+    found.discard(None)
+    return sorted(found, key=lambda item: (_manifest_name_key(item), item))
+
+
+#: pdf-organize's script; None is the copy beside this skill in the plugin.
+_ORGANIZE_PY = None
+
+
+def _load_organize():
+    """pdf-organize's `organize` module, loaded once from this plugin.
+
+    Its canvas parser finds the vault paths and Markdown an Obsidian Canvas
+    board holds, so a rename repairs boards with it rather than with a
+    second copy. A failed load raises ImportError, which the dependency
+    scan treats as a board it cannot read.
+    """
+    module = sys.modules.get("_knowledge_organize")
+    if module is None:
+        import importlib.util
+        path = _ORGANIZE_PY or os.path.join(
+            os.path.dirname(os.path.dirname(os.path.dirname(
+                os.path.realpath(__file__)))),
+            "pdf-organize", "scripts", "organize.py")
+        if not os.path.isfile(path):
+            raise ImportError("%s is not installed" % path)
+        spec = importlib.util.spec_from_file_location(
+            "_knowledge_organize", path)
+        module = importlib.util.module_from_spec(spec)
+        try:
+            spec.loader.exec_module(module)
+        except (Exception, SystemExit) as exc:
+            raise ImportError("%s cannot be loaded: %s" % (path, exc)) from None
+        sys.modules["_knowledge_organize"] = module
+    return module
+
+
+def _is_canvas(path):
+    """Whether ``path`` is an Obsidian Canvas board."""
+    return os.path.basename(path).casefold().endswith(".canvas")
+
+
+def _canvas_dependency_names(text, image_names, old_slug, include_note=True,
+                             needles=None):
+    """Known old image/note names an Obsidian Canvas board cites.
+
+    A file card or group background holds a vault path, named by its
+    basename as a link is; a text card holds Markdown, prefiltered by
+    ``needles`` as a note is. Link cards, labels and ids are never read.
+    Raises ValueError when the board is not valid JSON.
+    """
+    classify = _dependency_classifier(image_names, old_slug, include_note)
+    found = set()
+    for _match, value, field in _load_organize()._canvas_strings(text):
+        if field == "text":
+            if needles is not None and not any(
+                    needle in view for view in _dependency_prefilter_views(value)
+                    for needle in needles):
+                continue
+            found.update(_markdown_dependency_names(
+                value, image_names, old_slug, include_note))
+        elif field:
+            found.add(classify(value))
+    found.discard(None)
+    return sorted(found, key=lambda item: (_manifest_name_key(item), item))
+
+
+def _stable_markdown_text(path, errors="strict"):
+    """Read one complete UTF-8 Markdown entry and reject concurrent changes.
+
+    ``errors`` is the decode error handler.
+    """
+    def stable(item):
+        return (item.st_dev, item.st_ino, item.st_mode, item.st_size,
+                getattr(item, "st_mtime_ns", int(item.st_mtime * 1e9)),
+                getattr(item, "st_ctime_ns", int(item.st_ctime * 1e9)))
+
+    entry_before = os.lstat(path)
+    target_before = os.stat(path)
+    if not stat.S_ISREG(target_before.st_mode):
+        raise ValueError("not a regular Markdown file")
+    # Read aliases for dependency discovery, but never wait on a FIFO swapped
+    # in after the path classification. Classify the actual handle first.
+    descriptor = os.open(path, os.O_RDONLY | os.O_NONBLOCK)
+    with os.fdopen(descriptor, "rb") as source:
+        opened_before = os.fstat(source.fileno())
+        if not stat.S_ISREG(opened_before.st_mode):
+            raise ValueError("changed to a non-regular Markdown file")
+        raw = source.read()
+        opened_after = os.fstat(source.fileno())
+    entry_after = os.lstat(path)
+    target_after = os.stat(path)
+    if (stable(entry_before) != stable(entry_after)
+            or not (stable(target_before) == stable(opened_before)
+                    == stable(opened_after) == stable(target_after))):
+        raise ValueError("changed while the dependency inventory read it")
+    try:
+        return raw.decode("utf-8-sig", errors)
+    except UnicodeDecodeError as exc:
+        raise ValueError("is not complete valid UTF-8 (%s)" % exc) from exc
+
+
+def _vault_markdown_files(vault):
+    """Yield every visible vault Markdown file, following folder links without cycles."""
+    for path in _vault_files(vault):
+        if os.path.basename(path).casefold().endswith(".md"):
+            yield path
+
+
+def _vault_reference_files(vault):
+    """Yield every visible Markdown note and Obsidian Canvas board."""
+    for path in _vault_files(vault):
+        if (os.path.basename(path).casefold().endswith(".md")
+                or _is_canvas(path)):
+            yield path
+
+
+def _vault_files(vault):
+    """Yield every visible vault file, following folder links without cycles."""
+    def failed(exc):
+        raise ValueError("cannot scan vault directory %r: %s" %
+                         (getattr(exc, "filename", None) or vault, exc)) from exc
+
+    seen = set()
+    for root, dirs, files in os.walk(vault, followlinks=True, onerror=failed):
+        try:
+            item = os.stat(root)
+        except OSError as exc:
+            raise ValueError("cannot identify vault directory %r: %s" %
+                             (root, exc)) from exc
+        identity = (item.st_dev, item.st_ino)
+        if identity in seen:
+            dirs[:] = []
+            continue
+        seen.add(identity)
+        dirs[:] = [name for name in dirs if not name.startswith(".")
+                   and name.casefold() != "node_modules"]
+        for name in files:
+            yield os.path.join(root, name)
+
+
+def _same_logical_note(path, owner_path):
+    """Identity-safe match for one directory entry, not a foreign hard link."""
+    if (_manifest_name_key(os.path.basename(path))
+            != _manifest_name_key(os.path.basename(owner_path))):
+        return False
+    try:
+        return (os.path.samefile(path, owner_path)
+                and os.path.samefile(os.path.dirname(path),
+                                     os.path.dirname(owner_path)))
+    except OSError as exc:
+        raise ValueError("cannot distinguish owner note %r from %r: %s" %
+                         (owner_path, path, exc)) from exc
+
+
+def _dependency_needles(old_slug, image_names):
+    """Portable name keys that every reportable target leaves in its note.
+
+    `_markdown_dependency_names` reports a target only when its unquoted
+    basename has the portable key of the old note or of an old image, and
+    masking only blanks text. Blanking can still change what `unquote` sees
+    at a boundary: a closed Obsidian `%%` comment directly before a target
+    (`[[%%c%%Adams_…]]`) is spaces in the full parse, but in the raw text its
+    closing `%` and the slug's first two hex letters decode as one byte
+    escape. `_dependency_prefilter_views` therefore also unquotes a view with
+    `%%` delimiters blanked; code spans, HTML comments and literal blocks end
+    in a backtick or `>`, and fence lines keep their newline, so no other
+    masked region can end in `%`. A note whose views contain none of these
+    keys cannot report anything, and skipping the full comment/code parse
+    for it is what keeps one vault scan cheap. Returns None (parse every
+    note) when a key starts with a combining mark, which NFC could compose
+    with the preceding delimiter (`<` + U+0338 is `≮`).
+    """
+    slug_key = _manifest_name_key(old_slug)
+    needles = {slug_key} | {key for key in map(_manifest_name_key, image_names)
+                            if slug_key not in key}
+    if any(unicodedata.category(key[:1] or "_").startswith("M")
+           for key in needles):
+        return None
+    return needles
+
+
+def _dependency_prefilter_views(text):
+    """Unquoted name-key views the `_dependency_needles` prefilter searches.
+
+    The raw view keeps every percent escape; the second blanks `%%`
+    delimiters as the full parse blanks a closed comment, so a comment's
+    closing `%` cannot swallow the first letters of a following target.
+    """
+    return (_manifest_name_key(urllib.parse.unquote(text)),
+            _manifest_name_key(urllib.parse.unquote(text.replace("%%", "  "))))
+
+
+def _vault_dependency_blockers(owner, old_slug, image_names, include_note=True):
+    """External old-note/image references, or incomplete-scan blockers.
+
+    Markdown notes and Obsidian Canvas boards are both scanned. A file
+    that is not UTF-8, or a board that is not valid JSON, blocks only when
+    its text holds an old name.
+    """
+    vault = owner.get("vault")
+    if vault is None:
+        return []
+    needles = _dependency_needles(old_slug, image_names)
+    blockers = []
+    try:
+        paths = _vault_reference_files(vault)
+        for path in paths:
+            if _same_logical_note(path, owner["path"]):
+                continue
+            try:
+                text = _stable_markdown_text(path, errors="surrogateescape")
+            except (OSError, ValueError, UnicodeError) as exc:
+                blockers.append({"path": os.path.abspath(path),
+                                 "error": "cannot scan Markdown dependency: %s" % exc})
+                continue
+            canvas = _is_canvas(path)
+            # surrogateescape keeps each undecodable byte as a lone surrogate.
+            problem = ("not complete valid UTF-8"
+                       if re.search("[\udc80-\udcff]", text) else None)
+            if canvas and problem is None:
+                try:
+                    found = _canvas_dependency_names(
+                        text, image_names, old_slug, include_note=include_note,
+                        needles=needles)
+                except (ImportError, ValueError, RecursionError) as exc:
+                    problem = exc
+            # JSON escapes can spell a name, so a parsed board is not
+            # prefiltered on its raw text.
+            if (needles is not None and (problem is not None or not canvas)
+                    and not any(needle in view
+                                for view in _dependency_prefilter_views(text)
+                                for needle in needles)):
+                continue
+            if problem is not None:
+                blockers.append({"path": os.path.abspath(path),
+                                 "error": "cannot parse this file, which may "
+                                          "cite an old name: %s" % problem})
+                continue
+            if not canvas:
+                found = _markdown_dependency_names(text, image_names, old_slug,
+                                                   include_note=include_note)
+            if found:
+                blockers.append({"path": os.path.abspath(path),
+                                 "references": found})
+    except (OSError, ValueError, UnicodeError) as exc:
+        path = getattr(exc, "filename", None) or vault
+        blockers.append({"path": os.path.abspath(path),
+                         "error": "cannot complete vault Markdown inventory: %s" % exc})
+    return sorted(blockers, key=lambda row: (
+        _manifest_name_key(row["path"]), row["path"]))
+
+
+def _dependency_error(blockers):
+    details = []
+    for blocker in blockers:
+        reason = blocker.get("error") or ("references " +
+                 ", ".join(blocker.get("references", ())))
+        details.append("%s (%s)" % (blocker["path"], reason))
+    # Repair rewrites references; it cannot make an unreadable note readable.
+    advice = ("make each named path readable, then re-run"
+              if blockers and all(blocker.get("error") for blocker in blockers)
+              else "rewrite them with `rename --phase repair` and re-probe")
+    return ("external Markdown dependencies block this changed-slug rename; "
+            + advice + ", or retain the old note and image paths: "
+            + "; ".join(details))
+
+
+def _attachment_vault_roots(attachments):
+    """Logical and physical vault-root candidates for Sources/Images.
+
+    A vault may symlink its whole ``Sources`` directory to a storage location.
+    The logical path then owns the vault's ``Articles`` folder while the real
+    target usually has none. Retaining both candidates lets owner identity
+    choose that logical vault without letting an alias between two complete
+    vaults borrow either one's note as attachment ownership evidence.
+    """
+    logical = os.path.abspath(attachments)
+    resolved = os.path.realpath(logical)
+    roots = []
+    for path in (logical, resolved):
+        parent = os.path.dirname(path)
+        if (os.path.basename(path).casefold() == "images"
+                and os.path.basename(parent).casefold() == "sources"):
+            root = os.path.dirname(parent)
+            if root not in roots:
+                roots.append(root)
+    return tuple(roots)
+
+
+def _bound_attachment_vault_root(owner_path, attachments):
+    """Bind canonical attachments to exactly one owner ``Articles`` identity."""
+    roots = _attachment_vault_roots(attachments)
+    if not roots:
+        return None
+    owner_parent = os.path.dirname(os.path.abspath(owner_path))
+    try:
+        owner_stat = os.stat(owner_parent)
+    except OSError as exc:
+        raise ValueError("cannot establish the owner note's Articles/ folder "
+                         "identity: %s" % exc) from exc
+    if not stat.S_ISDIR(owner_stat.st_mode):
+        raise ValueError("--owner-note parent is not an Articles directory")
+    owner_identity = owner_stat.st_dev, owner_stat.st_ino
+
+    candidates = []
+    for root in roots:
+        articles = os.path.join(root, "Articles")
+        try:
+            item = os.stat(articles)
+        except FileNotFoundError:
+            continue
+        except OSError as exc:
+            raise ValueError("cannot establish the owner note's vault binding "
+                             "through %r: %s" % (articles, exc)) from exc
+        if not stat.S_ISDIR(item.st_mode):
+            raise ValueError("canonical vault path is not an Articles directory: "
+                             "%r" % articles)
+        candidates.append((root, (item.st_dev, item.st_ino)))
+
+    identities = {identity for _root, identity in candidates}
+    if len(identities) > 1:
+        raise ValueError(
+            "--attachments resolves between multiple vaults with distinct "
+            "Articles/ folders; use the canonical Sources/Images path for the "
+            "owner note's vault")
+    matches = [root for root, identity in candidates
+               if identity == owner_identity]
+    if not matches:
+        raise ValueError("--owner-note is not in the Articles/ folder for this "
+                         "Sources/Images vault")
+
+    lexical_owner_root = os.path.dirname(owner_parent)
+    chosen = (lexical_owner_root if lexical_owner_root in matches else matches[0])
+    # Preserve the established canonical spelling used in blocker reports
+    # (`/private/var/...` on macOS), while resolving only the vault root itself;
+    # a symlinked Sources/ child still stays attached to this logical vault.
+    return os.path.realpath(chosen)
+
+
+def _owner_namespace(owner_note, slug, attachments):
+    """Validate the note name, its unique Articles slot, and vault binding.
+
+    Returns ``(path, vault)``; ``vault`` is None for a noncanonical folder.
+    """
+    path = os.path.abspath(os.fspath(owner_note))
+    parent = os.path.dirname(path)
+    expected = slug + ".md"
+    if os.path.basename(parent).casefold() != "articles":
+        raise ValueError("--owner-note must be a direct child of Articles/: %r" % path)
+    if _manifest_name_key(os.path.basename(path)) != _manifest_name_key(expected):
+        raise ValueError("--owner-note must be Articles/%s for this operation" % expected)
+
+    # Bind canonical <vault>/Sources/Images paths to that same vault's
+    # Articles folder. Noncanonical attachment folders remain usable for
+    # isolated tests and deliberate library calls, but still require an
+    # Articles direct child and all positive evidence below.
+    # A noncanonical attachment folder returns None and keeps the documented
+    # isolated-library behavior. A canonical logical or physical path must bind
+    # to this exact Articles directory, and ambiguity raises here.
+    vault = _bound_attachment_vault_root(path, attachments)
+
+    try:
+        with os.scandir(parent) as entries:
+            matches = [entry.path for entry in entries
+                       if _manifest_name_key(entry.name)
+                       == _manifest_name_key(expected)]
+    except OSError as exc:
+        raise ValueError("cannot inventory the owner note's Articles folder: %s" % exc) from exc
+    if len(matches) != 1:
+        raise ValueError("Articles/%s has %d portable name occupants; ownership "
+                         "is ambiguous" % (expected, len(matches)))
+    try:
+        if not os.path.samefile(path, matches[0]):
+            raise ValueError("--owner-note does not identify the unique Articles/%s" % expected)
+    except OSError as exc:
+        raise ValueError("--owner-note cannot be identified safely: %s" % exc) from exc
+    return path, vault
+
+
+def _load_clipping_owner(owner_note, slug, attachments, *, require_vault=False):
+    """Snapshot exact clipping-note evidence for a destructive image action."""
+    if not owner_note:
+        raise ValueError("--owner-note is required to overwrite or rename clipping images")
+    path, vault = _owner_namespace(owner_note, slug, attachments)
+    with tempfile.TemporaryDirectory(prefix="clipping_owner.") as scratch:
+        copied = os.path.join(scratch, "owner.md")
+        try:
+            snapshot = _stable_regular_snapshot(
+                path, copy_to=copied, copy_mode=0o600)
+        except (OSError, UnicodeError) as exc:
+            raise ValueError(
+                "--owner-note is not a stable readable regular file: %s" % exc
+            ) from exc
+        try:
+            with open(copied, "r", encoding="utf-8-sig") as fh:
+                note_text = fh.read()
+        except (OSError, UnicodeDecodeError) as exc:
+            raise ValueError("--owner-note is not a stable UTF-8 clipping note: %s" % exc) from exc
+        origin = read_source(copied)
+        # Ownership evidence never comes from frontmatter text itself: the
+        # embeds are read from the body behind a closed leading YAML block.
+        split = split_frontmatter(note_text)
+        try:
+            current = split is not None and "sources" in parse_source_fields(split[0])
+        except ValueError:
+            current = False
+        if not current or not origin or not normalize_url(origin):
+            raise ValueError("--owner-note does not have a valid HTTP(S) URL as "
+                             "its first current sources item")
+        embeds = _rendered_embed_basenames(split[1])
+    if require_vault and vault is None:
+        raise ValueError(
+            "destructive image operations require --attachments to be the "
+            "owner note's canonical <vault>/Sources/Images folder so the "
+            "vault-wide dependency scan cannot be bypassed")
+    return {"path": path, "slug": slug, "attachments": attachments,
+            "snapshot": snapshot, "embeds": embeds, "vault": vault,
+            "text": note_text, "origin": normalize_url(origin),
+            "research_extract": is_research_extract_text(note_text)}
+
+
+def _refuse_research_extract(owner, action):
+    """A legacy wiki-add research extract may own placements, not replacements.
+
+    wiki-add creates none. An extract's images belong to it. Only the
+    destructive paths call this: an ordinary non-overwrite `place` owned by an
+    extract stays allowed as legacy behaviour, although no caller relies on it.
+    """
+    if owner is not None and owner.get("research_extract"):
+        raise ValueError("%s is a wiki-add research extract; clipping-clean "
+                         "leaves it and its images unchanged (%s refused)"
+                         % (owner["path"], action))
+
+
+def _validate_clipping_owner(owner):
+    """Refuse if either the owner bytes or its portable note slot changed."""
+    path, _vault = _owner_namespace(owner["path"], owner["slug"], owner["attachments"])
+    current = _stable_regular_snapshot(path)
+    if current != owner["snapshot"]:
+        raise ValueError("--owner-note changed during the image operation; refusing stale ownership")
+
+
+def _require_owned_attachment(owner, filename):
+    _validate_clipping_owner(owner)
+    wanted = _manifest_name_key(filename)
+    matches = [name for name in owner["embeds"]
+               if _manifest_name_key(name) == wanted]
+    if len(matches) != 1:
+        raise ValueError("%s is not an exact rendered filename-only embed in %s; "
+                         "refusing to claim an unattributed attachment" %
+                         (filename, owner["path"]))
+
+
+def _restore_after_slot_conflict(final, published, predecessor, predecessor_snapshot,
+                                 stage, stage_parent):
+    """Conditionally undo this publication after a late extension twin."""
+    rollback = os.path.join(stage, ".slot-conflict-rollback")
+    os.mkdir(rollback)
+    if predecessor is None:
+        remove_expected(final, published, _stable_regular_snapshot, rollback,
+                        stage_parent=stage_parent,
+                        recovery_prefix=".clipping-recovery-")
+        return
+    if not os.path.lexists(final):
+        link_noreplace(predecessor, final)
+        if _stable_regular_snapshot(final) != predecessor_snapshot:
+            raise PublicationConflict(
+                "%s could not be verified after restoration" % final,
+                recovery_path=predecessor, keep_stage=True)
+        return
+    replace_expected(predecessor, final, published, _stable_regular_snapshot,
+                     rollback, stage_parent=stage_parent,
+                     recovery_prefix=".clipping-recovery-")
+
+
+def _remove_copied_source(src, expected):
+    """Remove only the exact source copied into the publication stage."""
+    src = os.path.abspath(src)
+    parent = os.path.dirname(src) or "."
+    try:
+        stage = tempfile.mkdtemp(prefix=".clipping-source-cleanup.", dir=parent)
+    except OSError as exc:
+        return ("published successfully, but retained scratch source %r because "
+                "conditional cleanup could not be staged: %s" % (src, exc))
+    keep_stage = False
+    try:
+        try:
+            removed = remove_expected(
+                src, expected, _stable_regular_snapshot, stage,
+                stage_parent=parent, recovery_prefix=".clipping-recovery-")
+        except PublicationConflict as exc:
+            keep_stage = exc.keep_stage
+            return ("published successfully, but retained the changed scratch "
+                    "source %r%s: %s" %
+                    (src, " (recovery: %s)" % exc.recovery_path
+                     if exc.recovery_path else "", exc))
+        except (OSError, UnicodeError) as exc:
+            # The conditional helper normally reports every partial state as a
+            # PublicationConflict. Preserve the private stage as a last-resort
+            # recovery path if the host raises outside that contract.
+            keep_stage = True
+            return ("published successfully, but scratch-source cleanup failed; "
+                    "preserve %s and %r: %s" % (stage, src, exc))
+        if not removed:
+            return None
+        displaced = os.path.join(stage, ".atomic-displaced")
+        try:
+            unchanged = _stable_regular_snapshot(displaced) == expected
+        except (OSError, ValueError):
+            unchanged = False
+        if unchanged:
+            return None
+        try:
+            link_noreplace(displaced, src)
+            restored = "restored at its original path"
+        except OSError as exc:
+            keep_stage = True
+            restored = "preserved at %s (%s)" % (displaced, exc)
+        return ("published successfully, but the scratch source changed during "
+                "conditional cleanup and was %s" % restored)
+    finally:
+        if not keep_stage:
+            shutil.rmtree(stage, ignore_errors=True)
+
+
+def _publish_file(src, final, overwrite=False, staging_parent=None, mode=0o644,
+                  before_publish=None, after_publish=None,
+                  expected_source=None):
+    """Publish complete bytes and conditionally remove the copied source.
+
+    New names use exclusive creation. An overwrite displaces and revalidates
+    only the exact regular file inspected on entry, preserves its permissions,
+    and reads the replacement back before success. The optional callbacks let
+    an image caller guard its broader ``stem_fig_N.*`` namespace on both sides
+    of the per-file publication; a late extension twin triggers conditional
+    rollback rather than leaving two current files.
+
+    On every publication failure the complete ``src`` remains the recovery
+    copy at the caller-visible path; download callers expose it as ``scratch``
+    and place callers retain it as ``source``. The private staged duplicate may
+    therefore be cleaned without losing the reviewed bytes.
+    """
+    src = os.path.abspath(src)
+    final = os.path.abspath(final)
+    parent = os.path.abspath(staging_parent or os.path.dirname(final) or ".")
+    if os.path.lexists(final):
+        if not overwrite:
+            raise FileExistsError(final)
+        target_expected = _stable_regular_snapshot(final)
+        publish_mode = target_expected[2]
+    else:
+        target_expected = None
+        publish_mode = mode
+    try:
+        if os.path.samefile(src, final):
+            raise ValueError("source and publication path are the same file")
+    except FileNotFoundError:
+        pass
+
+    stage = tempfile.mkdtemp(prefix=".clipping-stage.", dir=parent)
+    keep_stage = False
+    predecessor = None
+    predecessor_snapshot = None
+    try:
+        staged = os.path.join(stage, "complete")
+        source_observed = _stable_regular_snapshot(
+            src, copy_to=staged, copy_mode=publish_mode)
+        if (expected_source is not None
+                and source_observed != expected_source):
+            raise PublicationConflict(
+                "%s changed after its bytes were inspected; refusing to "
+                "publish a different render" % src)
+        if before_publish is not None:
+            before_publish()
+        if target_expected is None:
+            published = publish_new(
+                staged, final, _stable_regular_snapshot, parent,
+                recovery_prefix=".clipping-recovery-")
+        else:
+            predecessor = os.path.join(stage, "predecessor")
+            link_noreplace(final, predecessor)
+            predecessor_snapshot = _stable_regular_snapshot(predecessor)
+            if predecessor_snapshot != target_expected:
+                raise PublicationConflict(
+                    "%s changed before its predecessor could be retained" % final)
+            published = replace_expected(
+                staged, final, target_expected, _stable_regular_snapshot,
+                stage, stage_parent=parent,
+                recovery_prefix=".clipping-recovery-")
+        if after_publish is not None:
+            try:
+                after_publish()
+            except Exception as conflict:
+                try:
+                    _restore_after_slot_conflict(
+                        final, published, predecessor, predecessor_snapshot,
+                        stage, parent)
+                except (OSError, PublicationConflict) as rollback_exc:
+                    keep_stage = True
+                    raise PublicationConflict(
+                        "late figure-slot conflict (%s); rollback was incomplete: "
+                        "%s; preserve %s" % (conflict, rollback_exc, stage),
+                        recovery_path=(getattr(rollback_exc, "recovery_path", None)
+                                       or stage), keep_stage=True) from rollback_exc
+                raise
+        return _remove_copied_source(src, source_observed)
+    except LinkUnavailable as exc:
+        # ``src`` is the caller-owned complete render/download and survives
+        # every failed publication. Do not pass through a staging_path that
+        # names the private duplicate this helper is about to clean. A distinct
+        # displaced predecessor can still require the private stage, though.
+        shared_recovery = getattr(exc, "recovery_path", None)
+        predecessor_recovery = (
+            shared_recovery
+            if shared_recovery and os.path.abspath(shared_recovery) != staged
+            else None)
+        if (predecessor_recovery
+                and _inside_existing_directory(predecessor_recovery, stage)):
+            keep_stage = True
+        reported = LinkUnavailable(src, final, exc.cause)
+        reported.strerror = (
+            "%s; the complete caller-owned source is preserved at %r" %
+            (reported.strerror, src))
+        if predecessor_recovery:
+            reported.strerror += (
+                "; the displaced predecessor is preserved at %r" %
+                predecessor_recovery)
+        reported.args = (reported.errno, reported.strerror)
+        reported.source_recovery_path = src
+        reported.recovery_path = predecessor_recovery or src
+        reported.staging_path = stage if keep_stage else None
+        reported.keep_stage = keep_stage
+        raise reported from exc
+    except PublicationConflict as exc:
+        keep_stage = keep_stage or exc.keep_stage
+        if keep_stage and not exc.recovery_path:
+            exc.recovery_path = stage
+        raise
+    finally:
+        if not keep_stage:
+            shutil.rmtree(stage, ignore_errors=True)
+
+
+def validate_slug(slug, what="--slug"):
+    """Reject a slug that could steer a write out of the Sources/Images folder.
+
+    The slug arrives as free text on the command line — the model types it, and
+    it is not necessarily the string `slug.py` produced. `Sources/Images/` is the
+    only place this script may write, so a separator, a parent-directory hop or
+    an empty value is refused here rather than resolved into a path.
+    """
+    if slug is None or not str(slug).strip():
+        raise ValueError(f"{what} is empty — refusing to write '<empty>_fig_N.ext'")
+    slug = str(slug)
+    # Names are reused in Markdown, wikilinks, URL-style targets, and HTML.
+    # Delimiter and control-character guards remain relevant on both hosts.
+    invalid = [ch for ch in slug
+               if ord(ch) < 0x20 or ord(ch) == 0x7f
+               or ch in '<>:"/\\|?*']
+    if invalid:
+        bad = invalid[0]
+        raise ValueError(f"{what} contains a path, markup, or control character "
+                         f"{bad!r}: {slug!r} — use the safe slug returned by "
+                         "the clipping slug helper")
+    if ".." in slug:
+        raise ValueError(f"{what} contains '..': {slug!r} — a slug is a "
+                         "filename stem, not a path")
+    # `.` passed every check above and named no note: it wrote `._fig_1.png`,
+    # a dotfile Obsidian does not show, this plugin's `Sources/Images` sweeps do
+    # not glob, and wiki-build's unused-figure diagnostic never sees. The
+    # download reported ok and the figure was gone.
+    if slug.startswith((".", " ")):
+        raise ValueError(f"{what} starts with a dot or space: {slug!r} — that "
+                         "would create a hidden or ambiguously trimmed filename")
+    if not slug.strip(". "):
+        raise ValueError(f"{what} is {slug!r} — that names no note; a slug is a "
+                         "filename stem, not a directory")
+    return slug
+
+
+def validate_index(index, what="figure index"):
+    """Require the positive counter promised by the figure naming contract."""
+    if isinstance(index, bool) or not isinstance(index, int) or index < 1:
+        raise ValueError(f"{what} must be a positive integer starting at 1: {index!r}")
+    return index
+
+
+def _positive_index_arg(value):
+    """argparse adapter for :func:`validate_index`."""
+    try:
+        index = int(value)
+        validate_index(index)
+    except (TypeError, ValueError) as exc:
+        raise argparse.ArgumentTypeError(str(exc)) from exc
+    return index
+
+
+def _positive_int_arg(value):
+    """Argparse adapter for positive transfer byte/time limits."""
+    try:
+        parsed = int(value)
+    except (TypeError, ValueError) as exc:
+        raise argparse.ArgumentTypeError("must be a positive integer") from exc
+    if parsed < 1:
+        raise argparse.ArgumentTypeError("must be a positive integer")
+    return parsed
+
+
+def _validate_transfer_limits(timeout, max_bytes, max_seconds):
+    """Reject disabled or ill-typed resource bounds on programmatic calls."""
+    for value, name in ((timeout, "timeout"), (max_seconds, "max_seconds")):
+        if (isinstance(value, bool) or not isinstance(value, (int, float))
+                or not math.isfinite(value) or value <= 0):
+            raise ValueError(f"{name} must be a positive finite number")
+    if isinstance(max_bytes, bool) or not isinstance(max_bytes, int) or max_bytes <= 0:
+        raise ValueError("max_bytes must be a positive integer")
+
+
+def _ensure_within(directory, path):
+    """Assert `path` really lands inside `directory`; return the resolved path."""
+    root = os.path.realpath(directory)
+    real = os.path.realpath(path)
+    if not _inside_existing_directory(path, directory, require_all=True):
+        raise ValueError(f"refusing to touch {real!r}: outside the attachments "
+                         f"folder {root!r}")
+    return real
+
+
+class _VettedTarget:
+    """One parsed URL hop and the exact socket addresses vetted for that hop."""
+
+    __slots__ = ("url", "scheme", "host", "port", "addresses",
+                 "request_target", "host_header")
+
+    def __init__(self, url, scheme, host, port, addresses, request_target,
+                 host_header):
+        self.url = url
+        self.scheme = scheme
+        self.host = host
+        self.port = port
+        self.addresses = tuple(addresses)
+        self.request_target = request_target
+        self.host_header = host_header
+
+
+# Integer prefixes keep module import declarative: constructing ``IPv6Network``
+# objects here trips the repository's no-import-time-execution contract. The
+# shifts retain respectively the high 96 or 48 bits used by those networks.
+_NAT64_WELL_KNOWN_PREFIX_96 = 0x64FF9B0000000000000000
+_NAT64_LOCAL_USE_PREFIX_48 = 0x64FF9B0001
+_IPV4_COMPATIBLE_PREFIX_96 = 0
+
+
+def _embedded_ipv4_addresses(ip):
+    """Return IPv4 endpoints carried by a known IPv6 transition form.
+
+    Some IPv6 spellings are classified globally by Python 3.9 even when the
+    endpoint they tunnel or translate to is private.  The socket receives the
+    IPv6 spelling, so checking only ``IPv6Address.is_global`` is insufficient
+    for SSRF policy.  Where the outer IPv6 form itself meets the policy,
+    subject its embedded IPv4 endpoint(s) to the same test as well.
+    """
+    if not isinstance(ip, ipaddress.IPv6Address):
+        return ()
+
+    found = []
+
+    def add(value):
+        if value is not None and value not in found:
+            found.append(value)
+
+    add(ip.ipv4_mapped)
+    add(ip.sixtofour)
+    if ip.teredo is not None:
+        add(ip.teredo[0])  # relay/server IPv4 address
+        add(ip.teredo[1])  # de-obfuscated client IPv4 address
+
+    packed = ip.packed
+    value = int(ip)
+    if value >> 32 == _NAT64_WELL_KNOWN_PREFIX_96:
+        add(ipaddress.IPv4Address(packed[12:16]))
+    elif value >> 80 == _NAT64_LOCAL_USE_PREFIX_48:
+        # RFC 6052's /48 layout splits the 32 IPv4 bits around the reserved
+        # ``u`` octet: prefix(48), v4[0:16], u(8), v4[16:32], suffix(40).
+        # A nonzero u octet is not a canonical translated address and is
+        # represented by 0.0.0.0 so the public-policy caller refuses it.
+        add(ipaddress.IPv4Address(
+            packed[6:8] + packed[9:11] if packed[8] == 0 else b"\0\0\0\0"))
+
+    # Deprecated IPv4-compatible form. Python 3.9 reports even
+    # ``::127.0.0.1`` as global, though an IPv6 stack may translate it to the
+    # IPv4 endpoint. The mapped form above occupies a different prefix.
+    if (value >> 32 == _IPV4_COMPATIBLE_PREFIX_96
+            and ip.ipv4_mapped is None):
+        add(ipaddress.IPv4Address(packed[12:16]))
+
+    # ISATAP interface identifiers end in 0000:5efe:v4 or 0200:5efe:v4.
+    if packed[8:12] in (b"\0\0\x5e\xfe", b"\x02\0\x5e\xfe"):
+        add(ipaddress.IPv4Address(packed[12:16]))
+    return tuple(found)
+
+
+def _public_ip(ip):
+    """Whether an address is suitable for the default open-web fetch policy."""
+    # Python releases disagree about whether the retired 6to4 prefix itself is
+    # globally routable. For SSRF purposes its only effective endpoint is the
+    # embedded IPv4 address, so apply the stable IPv4 policy directly instead
+    # of inheriting that version-dependent outer classification.
+    if isinstance(ip, ipaddress.IPv6Address) and ip.sixtofour is not None:
+        return _public_ip(ip.sixtofour)
+    # Python 3.9 can report the deprecated IPv6 site-local fec0::/10 range as
+    # global. Hosts may still route it internally, so reject it explicitly.
+    site_local = (getattr(ip, "version", None) == 6
+                  and (int(ip) >> 118) == (int(ipaddress.IPv6Address("fec0::")) >> 118))
+    ordinary_public = (
+        ip.is_global and not ip.is_loopback and not ip.is_link_local
+        and not ip.is_private and not ip.is_reserved and not ip.is_multicast
+        and not ip.is_unspecified and not site_local)
+    if not ordinary_public:
+        return False
+    return all(_public_ip(embedded)
+               for embedded in _embedded_ipv4_addresses(ip))
+
+
+def _request_path(parts, original_url):
+    """Build an ASCII origin-form request target without re-parsing the URL."""
+    path = urllib.parse.quote(
+        parts.path or "/", safe="/%:@!$&'()*+,;=-._~")
+    # SplitResult does not distinguish `/path` from `/path?`; preserve that
+    # delimiter because an origin is allowed to route the two targets apart.
+    if "?" in original_url.split("#", 1)[0]:
+        path += "?" + urllib.parse.quote(
+            parts.query, safe="/%?:@!$&'()*+,;=-._~")
+    return path
+
+
+def _vetted_target(url, allow_private=False):
+    """Parse and resolve one URL hop exactly once.
+
+    For HTTP(S), every returned address is classified before any socket opens,
+    then the complete vetted ``getaddrinfo`` result is carried to
+    :func:`_connect_vetted`. The hostname is never handed to a connector a
+    second time. ``data:`` returns ``None`` because it has no network target.
+    """
+    try:
+        parts = urllib.parse.urlsplit(url)
+    except (TypeError, ValueError) as exc:
+        raise ValueError("invalid URL: %s" % _report_url(url)) from exc
+    scheme = parts.scheme.lower()
+    if scheme not in ALLOWED_SCHEMES:
+        raise ValueError(f"unsupported URL scheme {scheme or '(none)'!r} — only "
+                         "http, https and data: URIs are fetched")
+    if scheme == "data":
+        return None
+    if any(ord(ch) < 0x20 or ord(ch) == 0x7f for ch in url):
+        raise ValueError("HTTP(S) URL contains a control character")
+    if not parts.hostname:
+        raise ValueError("URL has no host: %s" % _report_url(url))
+    if parts.username is not None or parts.password is not None:
+        raise ValueError("credentials in HTTP(S) URLs are not supported")
+    authority = parts.netloc.rsplit("@", 1)[-1]
+    if authority.startswith("["):
+        explicit_port = authority.partition("]")[2].startswith(":")
+    else:
+        explicit_port = ":" in authority
+    if explicit_port and authority.endswith(":"):
+        raise ValueError("invalid empty port in URL")
+    try:
+        parsed_port = parts.port
+    except ValueError as exc:
+        raise ValueError(f"invalid port in URL: {exc}") from exc
+    if parsed_port == 0:
+        raise ValueError("invalid zero port in URL")
+    port = (parsed_port if parsed_port is not None
+            else (443 if scheme == "https" else 80))
+
+    logical_host = parts.hostname
+    try:
+        host = logical_host.encode("idna").decode("ascii")
+    except UnicodeError as exc:
+        raise ValueError(f"invalid internationalized host {logical_host!r}") from exc
+
+    # inet_aton accepts legacy numeric forms that getaddrinfo interprets
+    # differently across operating systems (0177.0.0.1 is 127.0.0.1 on Linux,
+    # but 177.0.0.1 on macOS). Refuse those before DNS under the public policy.
+    if not allow_private:
+        try:
+            numeric = socket.inet_ntoa(socket.inet_aton(host))
+        except OSError:
+            numeric = None
+        if numeric is not None and numeric != host:
+            raise ValueError(
+                f"ambiguous numeric IPv4 host {logical_host!r} — use {numeric!r} "
+                "instead (pass --allow-private-hosts if intended)")
+
+    try:
+        infos = socket.getaddrinfo(host, port, type=socket.SOCK_STREAM)
+    except socket.gaierror as exc:
+        raise ValueError(f"cannot resolve host {logical_host!r}: {exc}") from exc
+    if not infos:
+        raise ValueError(f"host {logical_host!r} resolved to no addresses")
+
+    addresses = []
+    seen = set()
+    for family, socktype, proto, canonname, sockaddr in infos:
+        if family not in (socket.AF_INET, socket.AF_INET6) or not sockaddr:
+            raise ValueError(
+                f"host {logical_host!r} resolved to an unsupported address family")
+        addr = str(sockaddr[0]).split("%", 1)[0]
+        try:
+            ip = ipaddress.ip_address(addr)
+        except ValueError as exc:
+            raise ValueError(
+                f"host {logical_host!r} resolved to an invalid address {addr!r}") from exc
+        if not allow_private and not _public_ip(ip):
+            raise ValueError(
+                f"host {logical_host!r} resolves to the non-public address {ip} — "
+                "refusing (pass --allow-private-hosts if that is intended)")
+        item = (family, socktype or socket.SOCK_STREAM, proto, canonname, sockaddr)
+        key = (family, item[1], proto, sockaddr)
+        if key not in seen:
+            addresses.append(item)
+            seen.add(key)
+
+    host_literal = f"[{host}]" if ":" in host else host
+    host_header = (f"{host_literal}:{port}" if explicit_port else host_literal)
+    return _VettedTarget(url, scheme, host, port, addresses,
+                         _request_path(parts, url), host_header)
+
+
+def check_url(url, allow_private=False):
+    """Allow only HTTP(S)/data and, by default, only public HTTP(S) targets."""
+    _vetted_target(url, allow_private)
+
+
+def _remaining_timeout(timeout, deadline):
+    remaining = deadline - time.monotonic()
+    if remaining <= 0:
+        raise TimeoutError("exceeded the wall-clock budget before the response body")
+    return min(timeout, remaining)
+
+
+def _connect_vetted(target, timeout, deadline):
+    """Connect only to an address returned by this hop's single resolution."""
+    errors = []
+    for family, socktype, proto, _canonname, sockaddr in target.addresses:
+        sock = socket.socket(family, socktype, proto)
+        try:
+            sock.settimeout(_remaining_timeout(timeout, deadline))
+            sock.connect(sockaddr)
+            return sock
+        except Exception as exc:
+            errors.append("%s: %s" % (sockaddr[0], exc))
+            sock.close()
+    raise OSError("could not connect to any vetted address for %s: %s" %
+                  (target.host, "; ".join(errors) or "no addresses"))
+
+
+def _request_once(target, timeout, deadline):
+    """Issue one GET over a pinned socket; return ``(connection, response)``."""
+    wire = _connect_vetted(target, timeout, deadline)
+    conn = None
+    try:
+        if target.scheme == "https":
+            # create_default_context enables certificate-chain validation and
+            # hostname checks. The logical hostname, never the pinned IP, is
+            # supplied for SNI and certificate matching.
+            context = ssl.create_default_context()
+            wire.settimeout(_remaining_timeout(timeout, deadline))
+            wire = context.wrap_socket(wire, server_hostname=target.host)
+        wire.settimeout(_remaining_timeout(timeout, deadline))
+        conn = http.client.HTTPConnection(target.host, target.port,
+                                          timeout=timeout)
+        # Setting the connected socket makes HTTPConnection skip connect(), so
+        # it has no opportunity to resolve target.host a second time.
+        conn.sock = wire
+        conn.request("GET", target.request_target, headers={
+            "Host": target.host_header,
+            "User-Agent": UA,
+            "Accept-Encoding": "identity",
+            "Connection": "close",
+        })
+        wire.settimeout(_remaining_timeout(timeout, deadline))
+        return conn, conn.getresponse()
+    except Exception:
+        if conn is not None:
+            conn.close()
+        else:
+            wire.close()
+        raise
+
+
+def _stream_to_file(resp, tmp, max_bytes, deadline, declared=None):
+    """Copy the response body to `tmp`, bounded in both bytes and wall-clock.
+
+    shutil.copyfileobj has no limit of either kind, and `--timeout` is a
+    per-socket-operation timeout: a server dripping bytes indefinitely resets it
+    on every chunk and never trips it.
+    """
+    # read1, not read: read(CHUNK) blocks until CHUNK bytes have accumulated, so
+    # a server dripping one byte at a time would sit inside a single read for
+    # hours and the deadline below would never be reached. read1 returns what
+    # has arrived, which puts the check between every drip.
+    read = getattr(resp, "read1", None) or resp.read
+    total = 0
+    with open(tmp, "wb") as fh:
+        while True:
+            if time.monotonic() > deadline:
+                raise TimeoutError("exceeded the wall-clock budget for this "
+                                   f"download after {total} bytes")
+            chunk = read(CHUNK)
+            if not chunk:
+                break
+            total += len(chunk)
+            if total > max_bytes:
+                raise ValueError(f"response exceeds the {max_bytes}-byte cap "
+                                 "(raise it with --max-bytes if intended)")
+            fh.write(chunk)
+    # `Content-Length` was used only as an upper bound, so a server that
+    # announced 100 KB, sent 58 bytes and closed produced an `ok` result and a
+    # corrupt PNG in the vault -- and a re-run was then refused as
+    # already-present. A short read is a failed download, not a small image.
+    if declared and total < declared:
+        raise ValueError("truncated download: %d of %d declared bytes before "
+                         "the connection closed" % (total, declared))
+    return total
+
+
+def _percent_decoded_chunks(text, start, deadline):
+    """Yield bounded percent-decoded pieces without copying the whole payload."""
+    pos = start
+    while pos < len(text):
+        if time.monotonic() > deadline:
+            raise TimeoutError("exceeded the wall-clock budget while decoding data: URI")
+        end = min(pos + CHUNK, len(text))
+        if end < len(text):
+            # Do not cut `%AB` across chunks. urllib intentionally leaves a
+            # malformed percent escape literal; carrying only a possible
+            # incomplete final triplet preserves that behavior.
+            if text[end - 1] == "%":
+                end -= 1
+            elif end - pos >= 2 and text[end - 2] == "%":
+                end -= 2
+        if end <= pos:  # CHUNK is much larger than 3; defensive only.
+            end = min(pos + 3, len(text))
+        yield urllib.parse.unquote_to_bytes(text[pos:end])
+        pos = end
+
+
+def _write_bounded(fh, chunk, total, max_bytes, deadline):
+    """Write one decoded data-URI chunk, enforcing byte and time limits."""
+    if time.monotonic() > deadline:
+        raise TimeoutError("exceeded the wall-clock budget while decoding data: URI")
+    total += len(chunk)
+    if total > max_bytes:
+        raise ValueError(f"data: URI decodes over the {max_bytes}-byte cap")
+    fh.write(chunk)
+    return total
+
+
+def _fetch_data_uri(url, tmp, max_bytes=DEFAULT_MAX_BYTES, deadline=None):
+    # RFC 2397: `data:[<mediatype>][;<param>=<value>…][;base64],<data>` — the
+    # mediatype may carry parameters, so the header is split at the FIRST
+    # comma and read as `;`-tokens, with base64 mode decided by the LAST
+    # token alone.  A regex admitting only a bare `;base64` refused
+    # `data:image/png;charset=utf-8;base64,…` and the common inline-SVG form
+    # `data:image/svg+xml;utf8,<svg…>` as malformed, so a legitimately
+    # clipped image was reported failed.
+    if deadline is None:
+        deadline = time.monotonic() + DEFAULT_MAX_SECONDS
+    comma = url.find(",")
+    if url[:5].lower() != "data:" or comma < 0:
+        raise ValueError("malformed data: URI")
+    if comma > 4096:
+        raise ValueError("data: URI media-type header is unreasonably large")
+    header = url[5:comma]
+    payload_start = comma + 1
+    tokens = header.split(";")
+    is_b64 = len(tokens) > 1 and tokens[-1].strip().lower() == "base64"
+    mime = tokens[0].strip()
+    payload_chars = len(url) - payload_start
+
+    # Cheap exact preflight for the common unescaped, whitespace-free base64
+    # form. Oversized input is rejected before base64 allocates its output.
+    if is_b64 and url.find("%", payload_start) < 0 \
+            and not any(url.find(ch, payload_start) >= 0 for ch in " \t\r\n\v\f") \
+            and payload_chars % 4 == 0:
+        padding = (2 if url.endswith("==") else 1 if url.endswith("=") else 0)
+        decoded_size = payload_chars // 4 * 3 - padding
+        if decoded_size > max_bytes:
+            raise ValueError(
+                f"data: URI decodes to {decoded_size} bytes, over the "
+                f"{max_bytes}-byte cap")
+    elif not is_b64 and payload_chars > max_bytes * 3:
+        # A percent triplet is the most compact representation: three source
+        # characters can produce no fewer than one decoded byte.
+        raise ValueError(f"data: URI necessarily exceeds the {max_bytes}-byte cap")
+
+    total = 0
+    with open(tmp, "wb") as fh:
+        if not is_b64:
+            for raw in _percent_decoded_chunks(url, payload_start, deadline):
+                total = _write_bounded(
+                    fh, raw, total, max_bytes, deadline)
+        else:
+            carry = b""
+            for raw in _percent_decoded_chunks(url, payload_start, deadline):
+                clean = raw.translate(None, b" \t\r\n\v\f")
+                data = carry + clean
+                complete = len(data) // 4 * 4
+                if complete >= 4:
+                    complete -= 4  # padding, if any, belongs to the final quartet
+                block, carry = data[:complete], data[complete:]
+                if b"=" in block:
+                    raise ValueError("invalid base64 data: padding before the end")
+                if block:
+                    try:
+                        decoded = base64.b64decode(block, validate=True)
+                    except binascii.Error as exc:
+                        raise ValueError(f"invalid base64 data: {exc}") from exc
+                    total = _write_bounded(
+                        fh, decoded, total, max_bytes, deadline)
+            try:
+                decoded = base64.b64decode(carry, validate=True)
+            except binascii.Error as exc:
+                raise ValueError(f"invalid base64 data: {exc}") from exc
+            total = _write_bounded(
+                fh, decoded, total, max_bytes, deadline)
+    return mime or None
+
+
+def _lottie_json(raw, label):
+    """Parse and minimally identify a Lottie animation JSON object."""
+    try:
+        animation = json.loads(raw.decode("utf-8-sig"))
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise ValueError(f"{label} is not valid UTF-8 Lottie JSON: {exc}") from exc
+    if not isinstance(animation, dict) or not isinstance(animation.get("layers"), list):
+        raise ValueError(f"{label} is not a Lottie animation object (missing layers)")
+    for field in ("w", "h", "fr"):
+        value = animation.get(field)
+        if (isinstance(value, bool) or not isinstance(value, (int, float))
+                or not math.isfinite(value) or value <= 0):
+            raise ValueError(
+                f"{label} is not a Lottie animation object ({field} must be positive)")
+    start, end = animation.get("ip", 0), animation.get("op")
+    if (isinstance(start, bool) or isinstance(end, bool)
+            or not isinstance(start, (int, float))
+            or not isinstance(end, (int, float))
+            or not math.isfinite(start) or not math.isfinite(end) or end <= start):
+        raise ValueError(f"{label} is not a Lottie animation object (invalid frame range)")
+    return animation
+
+
+def _dotlottie_animation_path(manifest):
+    """Return the manifest-selected animation path for dotLottie v1 or v2."""
+    version = manifest.get("version") if isinstance(manifest, dict) else None
+    if not isinstance(version, str) or version.split(".", 1)[0] not in ("1", "2"):
+        raise ValueError("dotLottie manifest version must be 1 or 2")
+    major = version.split(".", 1)[0]
+    animations = manifest.get("animations")
+    if not isinstance(animations, list) or not animations:
+        raise ValueError(
+            "invalid dotLottie manifest: animations must be a non-empty list")
+
+    ids = []
+    for item in animations:
+        animation_id = item.get("id") if isinstance(item, dict) else None
+        if (not isinstance(animation_id, str)
+                or not re.fullmatch(r"[A-Za-z0-9._ -]+", animation_id)
+                or animation_id in (".", "..")):
+            raise ValueError("dotLottie animation id is missing or unsafe")
+        if animation_id in ids:
+            raise ValueError(f"duplicate dotLottie animation id {animation_id!r}")
+        ids.append(animation_id)
+
+    if major == "2":
+        initial = manifest.get("initial")
+        if initial is not None and not isinstance(initial, dict):
+            raise ValueError("dotLottie v2 initial must be an object")
+        selected = initial.get("animation") if initial else None
+        directory = "a"
+    else:
+        selected = manifest.get("activeAnimationId")
+        directory = "animations"
+    if selected is not None and not isinstance(selected, str):
+        raise ValueError("dotLottie initial animation id must be a string")
+    selected = selected or ids[0]
+    if selected not in ids:
+        raise ValueError(
+            f"dotLottie initial animation {selected!r} is not in the manifest")
+    return f"{directory}/{selected}.json"
+
+
+def _reject_duplicate_zip_members(archive):
+    """Refuse a ZIP whose exact member names are not unique.
+
+    ``ZipFile.getinfo(name)`` resolves through a one-entry-per-name mapping,
+    while callers iterating ``infolist()`` can select a different occurrence.
+    A duplicate manifest or selected animation would therefore let validation
+    inspect different bytes from the renderer.  dotLottie needs neither form
+    of ambiguity, so reject it before trusting any member.
+    """
+    seen = set()
+    duplicates = set()
+    for info in archive.infolist():
+        if info.filename in seen:
+            duplicates.add(info.filename)
+        seen.add(info.filename)
+    if duplicates:
+        raise ValueError(
+            "dotLottie ZIP contains duplicate member name(s): %s" %
+            ", ".join(repr(name) for name in sorted(duplicates)))
+
+
+def _validate_lottie_source(path, max_json_bytes):
+    """Accept only Lottie JSON or a dotLottie ZIP containing bounded JSON."""
+    if zipfile.is_zipfile(path):
+        try:
+            with zipfile.ZipFile(path) as archive:
+                _reject_duplicate_zip_members(archive)
+                manifest = next(
+                    (info for info in archive.infolist()
+                     if not info.is_dir() and info.filename == "manifest.json"),
+                    None)
+                if manifest is None:
+                    raise ValueError(
+                        "ZIP is not dotLottie: missing root manifest.json")
+                if manifest.flag_bits & 0x1:
+                    raise ValueError("dotLottie manifest is encrypted")
+                if manifest.file_size > max_json_bytes:
+                    raise ValueError("dotLottie manifest exceeds the size cap")
+                with archive.open(manifest) as source:
+                    manifest_raw = source.read(max_json_bytes + 1)
+                if len(manifest_raw) > max_json_bytes:
+                    raise ValueError("dotLottie manifest exceeds the size cap")
+                try:
+                    manifest_data = json.loads(manifest_raw.decode("utf-8-sig"))
+                except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+                    raise ValueError(f"invalid dotLottie manifest: {exc}") from exc
+                animation_path = _dotlottie_animation_path(manifest_data)
+                try:
+                    chosen = archive.getinfo(animation_path)
+                except KeyError as exc:
+                    raise ValueError(
+                        f"dotLottie manifest references missing {animation_path!r}") from exc
+                if chosen.is_dir():
+                    raise ValueError(
+                        f"dotLottie animation path {animation_path!r} is a directory")
+                if chosen.flag_bits & 0x1:
+                    raise ValueError("dotLottie animation JSON is encrypted")
+                if chosen.file_size > max_json_bytes:
+                    raise ValueError(
+                        "expanded animation JSON exceeds the %d-byte cap" %
+                        max_json_bytes)
+                with archive.open(chosen) as source:
+                    raw = source.read(max_json_bytes + 1)
+                if len(raw) > max_json_bytes:
+                    raise ValueError(
+                        "expanded animation JSON exceeds the %d-byte cap" %
+                        max_json_bytes)
+        except (OSError, zipfile.BadZipFile, RuntimeError) as exc:
+            raise ValueError(f"invalid dotLottie archive: {exc}") from exc
+        _lottie_json(raw, chosen.filename)
+        return "dotlottie"
+
+    with open(path, "rb") as source:
+        raw = source.read(max_json_bytes + 1)
+    if len(raw) > max_json_bytes:
+        raise ValueError(
+            f"animation JSON exceeds the {max_json_bytes}-byte cap")
+    _lottie_json(raw, "source")
+    return "json"
+
+
+def _refuse_existing(attachments, slug, index, overwrite, extension=None,
+                     owner=None, _published=None):
+    """Refuse a figure slot that is already occupied, unless asked to overwrite.
+
+    `shutil.move` onto an existing path replaces it with no error and no way
+    back, so a re-run with the wrong `--start`, or a second article that slugs
+    the same, silently destroyed the figures already filed under that name.
+    `rename` has refused an occupied destination since it was written; this is
+    the same rule on the download path, which had no such check at all.
+
+    The slot is `<slug>_fig_<index>.*`, not one exact filename: the real type
+    is only known after the bytes arrive, so checking the final path alone
+    would still overwrite a `.webp` with a `.png` at the same index — the
+    extension-twin this script exists to prevent, in reverse.
+
+    No clipping-clean workflow replaces an existing attachment
+    (references/images.md: existing attachments are never replaced, and a
+    format change takes a new number), so the refusal points only at the next
+    free number. The low-level replacement capability is kept as defence in
+    depth, behind both explicit `--overwrite` and positive evidence from the
+    exact clipping note that embeds the occupied filename.
+    """
+    owned = read_manifest(os.path.join(attachments, MANIFEST_FILE))
+    prefix = _manifest_name_key(f"{slug}_fig_{index}.")
+    for name in owned:
+        if _manifest_name_key(name).startswith(prefix):
+            raise ValueError(f"{name} is recorded in the PDF figure manifest — "
+                             "clipping-clean cannot replace that producer's figure")
+    hit = _glob_slug(attachments, slug, f"_fig_{index}.*")
+    if overwrite:
+        if owner is None and _published is None:
+            raise ValueError("--owner-note is required with --overwrite")
+        if owner is not None:
+            _validate_clipping_owner(owner)
+            for path in hit:
+                _require_owned_attachment(owner, os.path.basename(path))
+        # Replacing a PNG with a WebP at the same number would leave both on
+        # disk, and consumers could not choose which is current. Keep the old
+        # figure intact and require a fresh number when the format changes.
+        if extension is not None:
+            final = os.path.join(attachments, f"{slug}_fig_{index}.{extension}")
+            if owner is not None:
+                _require_owned_attachment(owner, os.path.basename(final))
+            elif _published != os.path.basename(final):
+                raise ValueError("internal publication evidence names the wrong figure")
+            if any(not _same_file(path, final) for path in hit):
+                raise ValueError(
+                    "figure slot is occupied by a different filename or format: "
+                    + ", ".join(os.path.basename(path) for path in hit)
+                    + " — --overwrite replaces only the existing file; use "
+                    "the next free index for a new format and update the embed")
+        return
+    if hit:
+        raise ValueError(
+            f"{os.path.basename(hit[0])} already exists in the attachments "
+            "folder — refusing to overwrite it. Existing attachments are never "
+            "replaced: leave it in place and use the next free figure number "
+            "(--start for stage, --index for place).")
+
+
+def _fetch_to_path(url, tmp, timeout, max_bytes, max_seconds, allow_private,
+                   record=None):
+    """Fetch `url` into `tmp` under every transport guard. -> (content_type, size)
+
+    The scheme allowlist, single-resolution address pinning, redirect guard,
+    `Content-Length` pre-check, byte cap, wall-clock deadline and truncation
+    check live in one place. `stage` and `fetch` are the same transport with
+    different destinations; a second fetch implementation is a guard bypass.
+    """
+    _validate_transfer_limits(timeout, max_bytes, max_seconds)
+    deadline = time.monotonic() + max_seconds
+    target = _vetted_target(url, allow_private)
+    if target is None:
+        return (_fetch_data_uri(url, tmp, max_bytes, deadline),
+                os.path.getsize(tmp))
+    current_url = url
+    for redirect_count in range(MAX_REDIRECTS + 1):
+        conn, resp = _request_once(target, timeout, deadline)
+        next_url = None
+        try:
+            status = resp.status
+            if status in REDIRECT_STATUSES:
+                location = resp.headers.get("Location")
+                if not location:
+                    raise urllib.error.HTTPError(
+                        current_url, status, "redirect has no Location header",
+                        resp.headers, None)
+                if redirect_count >= MAX_REDIRECTS:
+                    raise ValueError(
+                        f"too many redirects (more than {MAX_REDIRECTS})")
+                next_url = urllib.parse.urljoin(current_url, location)
+            elif not 200 <= status < 300:
+                raise urllib.error.HTTPError(
+                    current_url, status,
+                    "HTTP status is neither success nor a supported redirect",
+                    resp.headers, None)
+            else:
+                content_type = resp.headers.get("Content-Type")
+                if record is not None:
+                    record["final_url"] = current_url
+                declared = resp.headers.get("Content-Length")
+                if declared and declared.isdigit() and int(declared) > max_bytes:
+                    raise ValueError(f"Content-Length {declared} exceeds the "
+                                     f"{max_bytes}-byte cap")
+                size = _stream_to_file(
+                    resp, tmp, max_bytes, deadline,
+                    int(declared) if declared and declared.isdigit() else None)
+                return content_type, size
+        finally:
+            resp.close()
+            conn.close()
+        # The redirect connection is closed before DNS can block. Vet and
+        # resolve its target before another request, without reading its body.
+        next_target = _vetted_target(next_url, allow_private)
+        if next_target is None:
+            raise ValueError("an HTTP(S) redirect cannot target a data: URI")
+        if target.scheme == "https" and next_target.scheme != "https":
+            raise ValueError("refusing an HTTPS-to-HTTP redirect downgrade")
+        current_url, target = next_url, next_target
+    raise AssertionError("redirect loop exhausted without returning")
+
+
+def download_one(url, attachments, slug, index, timeout=45,
+                 max_bytes=DEFAULT_MAX_BYTES, max_seconds=DEFAULT_MAX_SECONDS,
+                 allow_private=False, overwrite=False, owner_note=None,
+                 require_vault=False):
+    """Fetch one image and move it to <attachments>/<slug>_fig_<index>.<ext>.
+
+    A TIFF or ICO lands there too, as `stage`'s scratch input for conversion,
+    but the result is `ok: false` with `needs_conversion: "png"`.
+    """
+    result = {"index": index, "url": _report_url(url),
+              "final_url": None, "ok": False, "path": None, "filename": None,
+              "ext": None, "bytes": 0, "error": None}
+    tmp = _temp_path()
+    publication_handed_off = False
+    try:
+        validate_slug(slug)
+        validate_index(index)
+        owner = (_load_clipping_owner(owner_note, slug, attachments,
+                                      require_vault=require_vault)
+                 if (overwrite or require_vault) else None)
+        if overwrite:
+            _refuse_research_extract(owner, "--overwrite")
+        # Before the fetch: no reason to spend a download on a slot we are
+        # going to refuse to write. Re-checked after, against the real path.
+        _refuse_existing(attachments, slug, index, overwrite, owner=owner)
+        content_type, size = _fetch_to_path(
+            url, tmp, timeout, max_bytes, max_seconds, allow_private, result)
+        if size == 0:
+            raise ValueError("empty response")
+        with open(tmp, "rb") as fh:
+            head = fh.read(4096)
+        ext = sniff_extension(head, content_type, url)
+        if ext is None:
+            # Name what the BYTES were, not just what the header claimed: a
+            # server that labels its 404 body `image/png` otherwise produces a
+            # refusal quoting `image/png`, which reads like the script is wrong.
+            raise ValueError("URL did not resolve to an image — the bytes look "
+                             f"like {describe_bytes(head)} (Content-Type: "
+                             f"{content_type or 'none'})")
+        if ext == "svg":
+            _validate_svg_file(tmp)
+        os.makedirs(attachments, exist_ok=True)
+        final = os.path.join(attachments, f"{slug}_fig_{index}.{ext}")
+        _ensure_within(attachments, final)
+        if owner is not None:
+            _require_owned_attachment(owner, os.path.basename(final))
+        _refuse_existing(attachments, slug, index, overwrite, ext, owner)
+        publication_handed_off = True
+        warning = _publish_file(
+            tmp, final, overwrite,
+            staging_parent=os.path.dirname(os.path.realpath(attachments)),
+            before_publish=lambda: _refuse_existing(
+                attachments, slug, index, overwrite, ext, owner),
+            after_publish=lambda: _refuse_existing(
+                attachments, slug, index, True, ext, owner,
+                None if overwrite else os.path.basename(final)))
+        result.update(ok=True, path=final, filename=os.path.basename(final),
+                      ext=ext, bytes=size, content_type=content_type)
+        if ext not in OUTPUT_EXTENSIONS:
+            # Keep the staged file as conversion input, but never offer it
+            # as an embeddable figure: Obsidian would not display it.
+            result.update(
+                ok=False, filename=None, needs_conversion="png",
+                error="needs conversion: %s; embed %s_fig_%d.png"
+                      % (_conversion_message(ext), slug, index))
+        if warning:
+            result["warning"] = warning
+    except Exception as exc:             # 404, timeout, unsupported scheme, non-image
+        result["error"] = f"{type(exc).__name__}: {exc}"
+        if publication_handed_off and os.path.lexists(tmp):
+            result["scratch"] = tmp
+    finally:
+        if not publication_handed_off and os.path.exists(tmp):
+            os.remove(tmp)
+        if result.get("final_url"):
+            result["final_url"] = _report_url(result["final_url"])
+    return result
+
+
+def fetch_source(url, out=None, timeout=45, max_bytes=DEFAULT_MAX_BYTES,
+                 max_seconds=DEFAULT_MAX_SECONDS, allow_private=False,
+                 overwrite=False, vault=None):
+    """Download a Lottie JSON/dotLottie source under the transport guards.
+
+    Lottie recovery needs the animation's `.json`/`.lottie` on disk
+    before anything can render it, and that is not an image, so `stage`
+    cannot carry it. It used to be fetched by a bare `urllib.request.urlopen`
+    inside a heredoc the model was told to write — which meant the one fetch in
+    this skill that runs on a URL lifted straight out of a hostile page was
+    also the one fetch with no scheme allowlist, no private-address refusal, no
+    redirect re-check, no size cap and no wall-clock cap. This is
+    `download_one`'s transport with a Lottie payload check in place of the image
+    sniff. Arbitrary HTML, executables and unrelated archives are refused before
+    an explicit output path can be published.
+
+    The workflow must keep this source outside the vault. The default is a
+    system temp file. An explicit `--out` requires the vault root and is
+    refused when it resolves inside that vault. Getting the
+    rendered result *into* `Sources/Images/` is `place_file`'s job, which is
+    where the slug, containment and occupied-slot guards live.
+    """
+    result = {"url": _report_url(url),
+              "final_url": None, "ok": False, "path": None, "bytes": 0,
+              "content_type": None, "source_format": None, "error": None}
+    tmp = _temp_path()
+    publication_handed_off = False
+    try:
+        if out is not None:
+            if vault is None:
+                raise ValueError("an explicit --out requires --vault so the "
+                                 "scratch path can be proved outside it")
+            if not os.path.isdir(vault):
+                raise ValueError("--vault is not a directory: %r" % vault)
+            if _at_or_inside_existing_directory(out, vault):
+                raise ValueError("--out must be outside --vault; Lottie source "
+                                 "bytes are scratch material, not vault content")
+        if out is not None and os.path.lexists(out) and not overwrite:
+            raise ValueError(f"{out!r} already exists — refusing to overwrite "
+                             "it (pass --overwrite if that is intended)")
+        content_type, size = _fetch_to_path(
+            url, tmp, timeout, max_bytes, max_seconds, allow_private, result)
+        if size == 0:
+            raise ValueError("empty response")
+        source_format = _validate_lottie_source(tmp, max_bytes)
+        if out is None:
+            out, tmp = tmp, None
+        else:
+            publication_handed_off = True
+            warning = _publish_file(tmp, out, overwrite, mode=0o600)
+            if warning:
+                result["warning"] = warning
+        result.update(ok=True, path=os.path.abspath(out), bytes=size,
+                      content_type=content_type, source_format=source_format)
+    except Exception as exc:             # 404, timeout, unsupported scheme, cap
+        result["error"] = f"{type(exc).__name__}: {exc}"
+        if publication_handed_off and tmp is not None and os.path.lexists(tmp):
+            result["scratch"] = tmp
+    finally:
+        if (not publication_handed_off and tmp is not None
+                and os.path.exists(tmp)):
+            try:
+                os.remove(tmp)
+            except OSError:
+                pass
+        if result.get("final_url"):
+            result["final_url"] = _report_url(result["final_url"])
+    return result
+
+
+def place_file(src, attachments, slug, index, overwrite=False, owner_note=None,
+               require_vault=False):
+    """Move a locally produced image into <attachments>/<slug>_fig_<index>.<ext>.
+
+    `download_one`'s placement half, for a file this script did not fetch — a
+    GIF recovered from Lottie source is rendered separately. Every guard the
+    download path applies to
+    its own writes applies here: `validate_slug`, `_refuse_existing` (before
+    and after), `_ensure_within`, and the byte sniff that picks the extension,
+    so the caller's claimed filename decides nothing.
+
+    It exists because the alternative was a rendering script doing its own
+    `os.replace(tmp, out)` into `Sources/Images/`, which silently overwrote a
+    previous run's GIF and exited 0 — and, since the folder is flat and shared
+    by three skills, the file it replaced was not necessarily this skill's.
+
+    The source is MOVED, not copied: it is a temp render, and a copy leaves the
+    twin behind. A source already inside the attachments folder is refused —
+    a half-written render must never sit in the vault (CONVENTIONS §8b:
+    "Nothing unfinished is ever written into the folder").
+    """
+    result = {"index": index, "source": src, "ok": False, "path": None,
+              "filename": None, "ext": None, "bytes": 0, "error": None}
+    try:
+        validate_slug(slug)
+        validate_index(index)
+        owner = (_load_clipping_owner(owner_note, slug, attachments,
+                                      require_vault=require_vault)
+                 if (overwrite or require_vault) else None)
+        if overwrite:
+            _refuse_research_extract(owner, "--overwrite")
+        if not os.path.isfile(src):
+            raise ValueError(f"--from-file {src!r} is not a file")
+        if _inside_existing_directory(src, attachments):
+            raise ValueError(
+                f"--from-file {src!r} is inside the attachments folder — "
+                "render to a temp path outside the vault and place it from "
+                "there, so nothing half-written ever appears in Sources/Images")
+        if require_vault:
+            for vault_root in _attachment_vault_roots(attachments):
+                if _inside_existing_directory(src, vault_root):
+                    raise ValueError(
+                        f"--from-file {src!r} is inside the vault {vault_root!r} — "
+                        "render to system scratch space outside the vault")
+        _refuse_existing(attachments, slug, index, overwrite, owner=owner)
+        # Sniff and size a stable private copy, then require publication to see
+        # the same source snapshot. Without this tie, a renderer or cleanup
+        # process could replace ``src`` after sniffing and a different byte
+        # format would be published under the stale extension.
+        with tempfile.TemporaryDirectory(prefix="clipping-place-check.") as check_dir:
+            inspected = os.path.join(check_dir, "source")
+            source_expected = _stable_regular_snapshot(
+                src, copy_to=inspected, copy_mode=0o600)
+            size = source_expected[3]
+            if size == 0:
+                raise ValueError("empty file")
+            with open(inspected, "rb") as fh:
+                head = fh.read(4096)
+            # No Content-Type and no URL: a local file has only its bytes,
+            # which is the evidence this script trusts anyway.
+            ext = sniff_extension(head)
+            if ext is None:
+                raise ValueError("the file is not an image — the bytes look like "
+                                 f"{describe_bytes(head)}")
+            if ext not in OUTPUT_EXTENSIONS:
+                raise ValueError("the file is " + _conversion_message(ext))
+            if ext == "svg":
+                _validate_svg_file(inspected)
+            os.makedirs(attachments, exist_ok=True)
+            final = os.path.join(attachments, f"{slug}_fig_{index}.{ext}")
+            _ensure_within(attachments, final)
+            if owner is not None:
+                _require_owned_attachment(owner, os.path.basename(final))
+            _refuse_existing(attachments, slug, index, overwrite, ext, owner)
+            warning = _publish_file(
+                src, final, overwrite,
+                staging_parent=os.path.dirname(os.path.realpath(attachments)),
+                before_publish=lambda: _refuse_existing(
+                    attachments, slug, index, overwrite, ext, owner),
+                after_publish=lambda: _refuse_existing(
+                    attachments, slug, index, True, ext, owner,
+                    None if overwrite else os.path.basename(final)),
+                expected_source=source_expected)
+        result.update(ok=True, path=final, filename=os.path.basename(final),
+                      ext=ext, bytes=size)
+        if warning:
+            result["warning"] = warning
+    except Exception as exc:
+        result["error"] = f"{type(exc).__name__}: {exc}"
+    return result
+
+
+def _same_file(a, b):
+    """True when two paths identify one file; missing paths cannot match."""
+    try:
+        return os.path.samefile(a, b)
+    except OSError:
+        return False
+
+
+#: Figure-label spellings only `figure-extract` produces (CONVENTIONS
+#: 8b): a supplementary marker, or a hierarchical `1-2` chapter label. This
+#: skill writes plain integers, so a file carrying one of these under a stem
+#: is a PDF's figure, not a clipping's.
+#:
+#: The separator is optional for the same reason `_FIG_GLOB` below is loose: a
+#: vault predating the naming convergence (§8c) also holds files whose label
+#: follows `_fig` with nothing in between, and a guard that only recognizes the
+#: current spelling is a guard those files walk straight through.
+_PDF_ONLY_LABEL = re.compile(r"_fig_?(?:S\d|SI\d|ED\d|\d+[.-]\d)", re.I)
+
+#: §8a's CONSUMER glob: `<stem>_fig`, never `<stem>_fig_`, any extension.
+#: The handoff planner reads the folder as a consumer — it takes whatever is filed
+#: under this note's stem — and the strict `_fig_*` it used to glob left every
+#: pre-convergence figure (§8c: the ones whose number follows `_fig` with
+#: nothing in between) behind under the OLD stem while reporting
+#: `{"renamed": 3, "failed": 0}`: a stranded half-set nothing reports and no
+#: re-run reassembles, because the next `rename` looks under the new stem.
+#: organize.py's `_fig` prefix match and `paper_scan.figures_for` both match
+#: loosely; this is the same rule. `_refuse_existing`'s strict `_fig_<N>.*` glob is a
+#: different question — a PRODUCER checking the exact slot it is about to
+#: write — and stays strict.
+_FIG_GLOB = "_fig*"
+
+# Consumer compatibility is a little wider than this producer's canonical
+# outputs: a note can still embed `.jpeg`, `.tif`, `.tiff` or `.ico` files that
+# this producer does not publish. The rename inventory must see those missing
+# references too.
+_CONSUMER_IMAGE_EXTENSIONS = (OUTPUT_EXTENSIONS | CONVERT_EXTENSIONS
+                              | frozenset(("jpeg", "tif")))
+
+
+def _embedded_figure_tail(filename, slug):
+    """Return an old-slug image embed's loose ``_fig*`` tail, or ``None``.
+
+    No directory entry exists for a missing attachment, so this is the
+    string-only counterpart of ``_figure_stem_end``. Portable normalized name
+    identity is conservative here: overlooking a missing embed would report a
+    rename complete while the note still contains a broken old-stem reference.
+    """
+    _stem, extension = os.path.splitext(filename)
+    if extension[1:].lower() not in _CONSUMER_IMAGE_EXTENSIONS:
+        return None
+    for index, char in enumerate(filename):
+        if char != "_":
+            continue
+        tail = filename[index:]
+        if (fnmatch.fnmatchcase(_manifest_name_key(tail), "_fig*")
+                and _manifest_name_key(filename[:index])
+                == _manifest_name_key(slug)):
+            return tail
+    return None
+
+
+def _pdf_named(sources, slug):
+    """Is there a `<slug>.pdf` under `sources`?  Cheap, read-only."""
+    def failed(exc):
+        raise ValueError("cannot verify PDF ownership in %r: %s" %
+                         (exc.filename or sources, exc)) from exc
+
+    key = _name_key(slug)
+    seen = set()
+    for root, dirs, files in os.walk(
+            sources, followlinks=True, onerror=failed):
+        dirs[:] = [name for name in dirs if not name.startswith(".")]
+        try:
+            item = os.stat(root)
+        except OSError as exc:
+            failed(exc)
+        identity = (item.st_dev, item.st_ino)
+        if identity in seen:
+            dirs[:] = []
+            continue
+        seen.add(identity)
+        for f in files:
+            if not f.lower().endswith(".pdf"):
+                continue
+            stem, ext = os.path.splitext(f)
+            if _name_key(stem) == key or _same_file(
+                    os.path.join(root, f), os.path.join(root, slug + ext)):
+                return True
+    return False
+
+
+def slug_occupancy(vault, slug):
+    """Check the PDF and image namespaces that can already own ``slug``."""
+    validate_slug(slug)
+    vault = os.path.abspath(os.path.expanduser(os.fspath(vault)))
+    if not os.path.isdir(vault):
+        raise ValueError("--vault is not a directory: %r" % vault)
+    sources = os.path.join(vault, "Sources", "PDFs")
+    attachments = os.path.join(vault, "Sources", "Images")
+    if os.path.lexists(sources) and not os.path.isdir(sources):
+        raise ValueError("canonical Sources/PDFs path is not a directory: %r" % sources)
+    if os.path.lexists(attachments) and not os.path.isdir(attachments):
+        raise ValueError("canonical Sources/Images path is not a directory: %r" % attachments)
+    pdf_occupied = _pdf_named(sources, slug) if os.path.isdir(sources) else False
+    figures = [os.path.basename(path)
+               for path in _glob_slug(attachments, slug, _FIG_GLOB)]
+    return {"ok": not pdf_occupied and not figures,
+            "vault": vault, "slug": slug,
+            "pdf_stem_occupied": pdf_occupied,
+            "image_occupants": figures}
+
+
+#: What a refused member of the set does to the members that were fine.  A
+#: figure set is renamed ALL OR NOTHING: the note's embeds are rewritten to one
+#: slug, so a half-renamed set is a note where some embeds resolve and some do
+#: not -- and neither slug holds the whole set, so no later run can tell which
+#: half is which.
+_STRADDLE = ("refused: this set is renamed all or nothing, and %s blocked it. "
+             "Nothing was renamed. Resolve that one and re-run.")
+
+
+def dependency_status(attachments, owner_note, old_slug, new_slug=None):
+    """Report external references that prevent retiring an old clipping stem.
+
+    With ``new_slug``, ``owner_note`` is the renamed Articles/<new_slug>.md of
+    a same-note re-stem (see ``_restem_dependency_status``).
+    """
+    if new_slug is not None:
+        return _restem_dependency_status(attachments, owner_note, old_slug,
+                                         new_slug)
+    validate_slug(old_slug, "--old-slug")
+    _refuse_recorded_new_note(owner_note, old_slug)
+    owner = _load_clipping_owner(owner_note, old_slug, attachments,
+                                 require_vault=True)
+    image_names = sorted(
+        (name for name in owner["embeds"]
+         if _embedded_figure_tail(name, old_slug) is not None),
+        key=lambda item: (_manifest_name_key(item), item))
+    if owner["vault"] is None:
+        raise ValueError("cannot infer a canonical vault from --owner-note and "
+                         "--attachments; a complete Markdown dependency scan "
+                         "cannot be certified")
+    blockers = _vault_dependency_blockers(owner, old_slug, image_names)
+    _validate_clipping_owner(owner)
+    return {"ok": not blockers, "vault": os.path.abspath(owner["vault"]),
+            "old_slug": old_slug, "images": image_names,
+            "blockers": blockers}
+
+
+def _plan_slug_rename(attachments, old_slug, new_slug, *, sources,
+                      owner_note=None, require_vault=False, restem=None,
+                      complete=True):
+    """Plan the complete owned image mapping without changing any files.
+
+    Every handoff phase uses this inventory. A current byte-identical
+    destination can be a previously prepared copy; other occupied slots fail
+    the whole plan. Every selected basename needs exact clipping ownership,
+    while PDF stems, manifests, supplementary labels and missing embeds block
+    the handoff. The loose consumer glob keeps all existing image spellings
+    visible without authorizing files from their names alone.
+
+    ``restem`` ("prepare" or "finalize") plans a same-note re-stem: the owner
+    is Articles/<new_slug>.md, which embeds each old name before its embeds
+    are republished and each mapped new name afterwards.
+
+    ``complete=False`` (the repair phase) skips the incomplete-scan refusal;
+    repair reports each unreadable note as a remaining blocker instead.
+    """
+    validate_slug(old_slug, "--old-slug")
+    validate_slug(new_slug, "--new-slug")
+    if sources is None:
+        raise ValueError("--sources is required for every rename so PDF-owned "
+                         "figures cannot be mistaken for clipping images")
+    if not os.path.isdir(sources):
+        # Like preflight, an absent canonical Sources/PDFs holds no PDFs.
+        if os.path.lexists(sources) or os.path.abspath(sources) not in [
+                os.path.join(root, "Sources", "PDFs")
+                for root in _attachment_vault_roots(attachments)]:
+            raise ValueError("--sources is not a directory: %r — cannot verify PDF ownership" % sources)
+        sources = None
+    if sources and _pdf_named(sources, old_slug):
+        return [{"from": old_slug + "_fig_*", "to": None, "ok": False,
+                 "error": "refusing to rename: %s.pdf exists in %s, so these "
+                          "figures belong to that document and are "
+                          "pdf-organize's to move, not this skill's"
+                          % (old_slug, sources)}]
+    if sources and _pdf_named(sources, new_slug):
+        return [{"from": old_slug + "_fig_*", "to": new_slug + "_fig_*", "ok": False,
+                 "error": "refusing to rename: the destination stem %s belongs "
+                          "to a PDF in %s; choose an unused clipping slug"
+                          % (new_slug, sources)}]
+    owner = _load_clipping_owner(owner_note, new_slug if restem else old_slug,
+                                 attachments, require_vault=require_vault)
+    _refuse_research_extract(owner, "rename")
+    owned = {_manifest_name_key(name)
+             for name in read_manifest(os.path.join(attachments, MANIFEST_FILE))}
+    # --- plan: every member is judged before any of them is touched ---------
+    # every Unicode spelling of the old slug: on macOS the on-disk files are
+    # often NFD while the argument is NFC, and glob compares bytes.
+    plan = []
+    for src in _glob_slug(attachments, old_slug, _FIG_GLOB):
+        base = os.path.basename(src)
+        # the matched spelling's length, not the argument's — NFC and NFD
+        # spellings of one slug differ in length.
+        stem_end = _figure_stem_end(attachments, base, old_slug, _FIG_GLOB)
+        if stem_end is None:  # `_glob_slug` established this; keep failure explicit.
+            raise ValueError("could not locate the matched figure stem in %r" % base)
+        # Everything after the stem is carried across verbatim, separator
+        # included, so a file written before the spellings converged keeps its
+        # own label under the new stem and stays with its set, rather than
+        # being re-spelled into the current convention by a rename.
+        tail = base[stem_end:]
+        dst = os.path.join(attachments, new_slug + tail)
+        destination_prefix = _manifest_name_key(
+            os.path.splitext(os.path.basename(dst))[0]) + "."
+        destination_slot = _glob_slug(
+            attachments, new_slug, glob.escape(os.path.splitext(tail)[0]) + ".*")
+        entry = {"from": base, "to": os.path.basename(dst), "ok": False,
+                 "error": None}
+        embedded = os.path.basename(dst) if restem == "finalize" else base
+        if _manifest_name_key(base) in owned:
+            entry["error"] = "recorded in the PDF figure manifest; not this skill's to rename"
+        elif any(name.startswith(destination_prefix) for name in owned):
+            entry["error"] = "destination is recorded in the PDF figure manifest"
+        elif _PDF_ONLY_LABEL.search(tail):
+            entry["error"] = ("label spelling only figure-extract "
+                              "writes; this file is a PDF's figure, not this "
+                              "note's")
+        elif sum(_manifest_name_key(name) == _manifest_name_key(embedded)
+                 for name in owner["embeds"]) != 1:
+            entry["error"] = ("%snot a unique portable rendered filename-only "
+                              "embed in %s; ownership is unproven" % (
+                                  "" if embedded == base else
+                                  "its new name %s is " % embedded,
+                                  owner["path"]))
+        elif not os.path.lexists(src):
+            entry["error"] = "source missing"
+        elif os.path.islink(src) or not os.path.isfile(src):
+            entry["error"] = "source is not a regular image file"
+        # lexists, not exists: a broken symlink at dst is still something there.
+        elif any(not _same_file(src, path) for path in destination_slot) \
+                or (os.path.lexists(dst) and not _same_file(src, dst)):
+            prepared = False
+            if (len(destination_slot) == 1
+                    and _manifest_name_key(os.path.basename(destination_slot[0]))
+                    == _manifest_name_key(os.path.basename(dst))):
+                try:
+                    prepared = _same_content(_stable_regular_snapshot(src),
+                                             _stable_regular_snapshot(dst))
+                except (OSError, UnicodeError, ValueError):
+                    prepared = False
+            if not prepared:
+                entry["error"] = ("destination exists (the figure slot includes "
+                                  "every extension)")
+        else:
+            try:
+                _ensure_within(attachments, src)
+                _ensure_within(attachments, dst)
+            except ValueError as exc:
+                entry["error"] = f"{type(exc).__name__}: {exc}"
+        plan.append((src, dst, entry))
+
+    # The folder walk above proves which files exist; the note supplies the
+    # inverse inventory. Without this pass a missing embedded attachment is
+    # silently omitted, and an empty folder misleadingly reports a successful
+    # empty rename even though the old note already has a broken figure.
+    existing = {_manifest_name_key(os.path.basename(src))
+                for src, _dst, _entry in plan}
+    with_new_copy = []
+    for base in sorted(owner["embeds"], key=lambda item: (
+            _manifest_name_key(item), item)):
+        tail = _embedded_figure_tail(base, old_slug)
+        if tail is None or _manifest_name_key(base) in existing:
+            continue
+        entry = {
+            "from": base,
+            "to": new_slug + tail,
+            "ok": False,
+            "error": ("owner note embeds this old-slug image, but the exact "
+                      "attachment is missing; restore it or replace the note "
+                      "embed with the documented missing-attachment "
+                      "placeholder before renaming"),
+        }
+        if restem is None and os.path.lexists(
+                os.path.join(attachments, new_slug + tail)):
+            with_new_copy.append(entry)
+        plan.append((os.path.join(attachments, base),
+                     os.path.join(attachments, new_slug + tail), entry))
+
+    # A changed stem retires both attachment names and, after publication, the
+    # old Articles path. Other vault notes can depend on either. The repair
+    # phase rewrites them only after preparation, so preparation must retain
+    # both names while dependencies remain. Refuse an incomplete inventory
+    # here; finalization separately requires no old dependencies and repeats
+    # that complete check around retirement.
+    dependency_images = sorted({
+        os.path.basename(src) for src, _dst, _entry in plan
+    } | {
+        name for name in owner["embeds"]
+        if _embedded_figure_tail(name, old_slug) is not None
+    }, key=lambda item: (_manifest_name_key(item), item))
+    # Path retirement is about the exact directory-entry spelling. NFD and NFC
+    # can coexist on a case-sensitive filesystem even though portable matching
+    # correctly treats them as one namespace for collision/ownership checks.
+    changed_slug = old_slug != new_slug
+    dependency_blockers = (_vault_dependency_blockers(
+        owner, old_slug, dependency_images)
+        if changed_slug and complete else [])
+    if with_new_copy:
+        # Finalize retires every old copy at once, only while the new note
+        # exists and no other note references the old names, and leaves the
+        # old note for old-note removal. An old copy deleted by hand after
+        # prepare also leaves a missing old name beside its new copy, so only
+        # that whole state is called retired. The swapped pair reads the
+        # same, so only the handoff record can name this owner the old note.
+        folder = os.path.dirname(owner["path"])
+        new_note = os.path.lexists(os.path.join(folder, new_slug + ".md"))
+        recorded = new_note and _manifest_name_key(
+            (_handoff_record(folder, new_slug) or ("",))[0]
+        ) == _manifest_name_key(os.path.basename(owner["path"]))
+        retired = (recorded and not existing and owner["vault"] is not None
+                   and not (dependency_blockers if changed_slug and complete
+                            else _vault_dependency_blockers(
+                                owner, old_slug, dependency_images)))
+        for entry in with_new_copy:
+            if retired:
+                entry["error"] = (
+                    "owner note embeds this old-slug image, but its attachment "
+                    "is missing while its mapped new copy %s exists and no "
+                    "other note references the old names, so a finalized "
+                    "handoff already retired it; do not restore it, finish "
+                    "with the dependencies re-probe and old-note removal"
+                    % entry["to"])
+            elif new_note:
+                entry["error"] += (
+                    "; its mapped new copy %s holds the bytes prepare copied, "
+                    "so restore from a scratch copy of it" % entry["to"])
+    dependency_errors = [row for row in dependency_blockers if row.get("error")]
+    if dependency_errors:
+        error = _dependency_error(dependency_errors)
+        if not plan:
+            entry = {"from": old_slug + ".md", "to": new_slug + ".md",
+                     "ok": False, "error": error,
+                     "dependency_blockers": dependency_blockers}
+            plan.append((None, None, entry))
+        else:
+            for _src, _dst, entry in plan:
+                entry["dependency_blockers"] = dependency_blockers
+                if not entry["error"]:
+                    entry["error"] = error
+
+    _validate_clipping_owner(owner)
+    blocked = [e for _s, _d, e in plan if e["error"]]
+    if blocked:
+        for _src, _dst, entry in plan:
+            if not entry["error"]:
+                entry["error"] = _STRADDLE % blocked[0]["from"]
+        return [e for _s, _d, e in plan]
+    for _src, _dst, entry in plan:
+        entry["ok"] = True
+    return [e for _s, _d, e in plan]
+
+
+def _failed_plan_rows(results):
+    """Each refused plan row as ``name (error)``, joined; empty when none."""
+    return "; ".join("%s (%s)" % (row.get("from"), row.get("error"))
+                     for row in results if not row.get("ok"))
+
+
+def _handoff_record_name(new_slug):
+    """The hidden Articles/ file that records a pending handoff's direction."""
+    return ".%s.handoff.json" % new_slug
+
+
+def _handoff_record(folder, new_slug):
+    """The ``(old note, new note)`` basenames a handoff record names, or None.
+
+    Both notes of a pending pair carry one web origin and embed images
+    under their own stems, so they read the same in either direction.
+    ``publish-note`` writes this record before the new note; it is the only
+    evidence of which note replaced which. An unreadable record is an error.
+    """
+    key = _manifest_name_key(_handoff_record_name(new_slug))
+    try:
+        names = [name for name in os.listdir(folder)
+                 if _manifest_name_key(name) == key]
+    except (FileNotFoundError, NotADirectoryError):
+        return None   # no folder, no record; the owner checks report it
+    except OSError as exc:
+        raise ValueError("cannot inventory %s: %s" % (folder, exc)) from exc
+    if not names:
+        return None
+    path = os.path.join(folder, names[0])
+    try:
+        if len(names) > 1:
+            raise ValueError("%d portable spellings" % len(names))
+        record = json.loads(_read_note_bytes(path, "the record"))
+        pair = tuple(record[side].rpartition("/")[2]
+                     for side in ("old_note", "new_note"))
+        if not all(name.endswith(".md") for name in pair):
+            raise ValueError("it does not name two notes")
+        return pair
+    except (AttributeError, KeyError, TypeError, ValueError) as exc:
+        raise ValueError("handoff record %s is unreadable: %s"
+                         % (path, exc)) from exc
+
+
+def _refuse_recorded_new_note(owner_note, slug):
+    """Refuse an old-note argument that a pending handoff names as new.
+
+    A record whose old note is gone belongs to a finished handoff.
+    """
+    folder = os.path.dirname(os.path.abspath(os.fspath(owner_note)))
+    pair = _handoff_record(folder, slug)
+    if pair and os.path.lexists(os.path.join(folder, pair[0])):
+        raise ValueError(
+            "%s is the new note of a pending handoff from %s (%s records it); "
+            "finish that handoff with %s as --owner-note" % (
+                os.path.basename(owner_note), pair[0],
+                _handoff_record_name(slug), pair[0]))
+
+
+def _handoff_plan(attachments, sources, owner_note, new_owner_note,
+                  old_slug, new_slug, complete=True):
+    """Validate one two-owner image mapping without changing either set."""
+    if old_slug == new_slug:
+        raise ValueError("a two-phase handoff requires two distinct slug spellings")
+    _refuse_recorded_new_note(owner_note, old_slug)
+    results = _plan_slug_rename(
+        attachments, old_slug, new_slug, sources=sources,
+        owner_note=owner_note, require_vault=True, complete=complete)
+    failed = _failed_plan_rows(results)
+    if failed:
+        raise ValueError("image handoff preflight failed: " + failed)
+
+    old_owner = _load_clipping_owner(
+        owner_note, old_slug, attachments, require_vault=True)
+    new_owner = _load_clipping_owner(
+        new_owner_note, new_slug, attachments, require_vault=True)
+    _refuse_research_extract(new_owner, "rename")   # old: _plan_slug_rename
+    if old_owner["origin"] != new_owner["origin"]:
+        raise ValueError("old and new owner notes do not have the same normalized "
+                         "web origin")
+    try:
+        if os.path.samefile(old_owner["path"], new_owner["path"]):
+            raise ValueError("old and new owner notes resolve to the same file; "
+                             "a two-phase handoff needs both paths live")
+    except FileNotFoundError as exc:
+        raise ValueError("both old and new owner notes must remain present") from exc
+
+    mapping = []
+    for row in results:
+        old_name, new_name = row["from"], row["to"]
+        old_path = os.path.join(attachments, old_name)
+        new_path = os.path.join(attachments, new_name)
+        if _same_file(old_path, new_path):
+            raise ValueError("%s and %s resolve to the same file; retain the "
+                             "existing names instead of attempting a two-owner "
+                             "handoff" % (old_name, new_name))
+        if sum(_manifest_name_key(name) == _manifest_name_key(old_name)
+               for name in old_owner["embeds"]) != 1:
+            raise ValueError("%s is no longer a unique rendered filename-only "
+                             "embed in the old owner note %s" %
+                             (old_name, old_owner["path"]))
+        if sum(_manifest_name_key(name) == _manifest_name_key(new_name)
+               for name in new_owner["embeds"]) != 1:
+            raise ValueError("%s is not a unique rendered filename-only embed in "
+                             "the new owner note %s" %
+                             (new_name, new_owner["path"]))
+        if any(_manifest_name_key(name) == _manifest_name_key(old_name)
+               for name in new_owner["embeds"]):
+            raise ValueError("the new owner note still embeds old image %s" % old_name)
+        mapping.append({"from": old_name, "to": new_name})
+
+    dependency = dependency_status(attachments, owner_note, old_slug)
+    incomplete = [row for row in dependency["blockers"] if row.get("error")]
+    if incomplete and complete:
+        raise ValueError(_dependency_error(incomplete))
+    _validate_clipping_owner(old_owner)
+    _validate_clipping_owner(new_owner)
+    return old_owner, new_owner, mapping, dependency
+
+
+def _same_note_restem(owner_note, new_owner_note, old_slug, new_slug):
+    """Whether ``rename`` names one note as both owners: a same-note re-stem."""
+    return (old_slug != new_slug and owner_note is not None
+            and new_owner_note is not None
+            and os.path.abspath(os.fspath(owner_note))
+            == os.path.abspath(os.fspath(new_owner_note)))
+
+
+def _restem_owner(attachments, owner_note, old_slug, new_slug):
+    """Load the renamed note a same-note re-stem acts for.
+
+    A note renamed outside the two-owner handoff can keep embedding images
+    under its former stem. Only Articles/<new_slug>.md may own them, and only
+    while no Articles/<old_slug>.md remains: a live old note still owns its
+    stem and needs the handoff instead.
+    """
+    validate_slug(old_slug, "--old-slug")
+    validate_slug(new_slug, "--new-slug")
+    if _manifest_name_key(old_slug) == _manifest_name_key(new_slug):
+        raise ValueError("a same-note re-stem needs two distinct portable stems")
+    owner = _load_clipping_owner(owner_note, new_slug, attachments,
+                                 require_vault=True)
+    _refuse_research_extract(owner, "rename")
+    old_key = _manifest_name_key(old_slug + ".md")
+    try:
+        with os.scandir(os.path.dirname(owner["path"])) as entries:
+            occupied = sorted(entry.name for entry in entries
+                              if _manifest_name_key(entry.name) == old_key)
+    except OSError as exc:
+        raise ValueError("cannot inventory the owner note's Articles folder: %s"
+                         % exc) from exc
+    if occupied:
+        raise ValueError("Articles/%s still exists; a same-note re-stem applies "
+                         "only when no old note remains, so use the two-owner "
+                         "handoff" % occupied[0])
+    return owner
+
+
+def _restem_dependency_status(attachments, owner_note, old_slug, new_slug,
+                              image_names=None):
+    """Report what still references a re-stemmed note's old image names.
+
+    No old note remains, so links to its name are not dependencies. Other
+    notes' references are ``blockers``, as in the handoff; the renamed note's
+    own are ``owner_references``, which its republished embeds clear. The
+    rename phases pass their fixed mapping so that a retired name stays in
+    every later probe; otherwise the old-stem files and embeds are read.
+    """
+    owner = _restem_owner(attachments, owner_note, old_slug, new_slug)
+    if image_names is None:
+        image_names = {os.path.basename(path) for path in
+                       _glob_slug(attachments, old_slug, _FIG_GLOB)}
+        image_names |= {name for name in owner["embeds"]
+                        if _embedded_figure_tail(name, old_slug) is not None}
+    image_names = sorted(set(image_names), key=lambda item: (
+        _manifest_name_key(item), item))
+    blockers = _vault_dependency_blockers(owner, old_slug, image_names,
+                                          include_note=False)
+    references = _markdown_dependency_names(owner["text"], image_names,
+                                            old_slug, include_note=False)
+    _validate_clipping_owner(owner)
+    return {"ok": not blockers and not references,
+            "vault": os.path.abspath(owner["vault"]), "old_slug": old_slug,
+            "new_slug": new_slug, "images": image_names, "blockers": blockers,
+            "owner_references": references}
+
+
+def _probe_error(report):
+    """The refusal for a dependency report that is not ``ok``."""
+    errors = []
+    if report.get("owner_references"):
+        errors.append("the re-stemmed note still references old image(s) %s; "
+                      "republish them under the new stem first" %
+                      ", ".join(report["owner_references"]))
+    if report.get("blockers") or not errors:
+        errors.append(_dependency_error(report.get("blockers", ())))
+    return "; ".join(errors)
+
+
+def _restem_plan(attachments, sources, owner_note, old_slug, new_slug, phase,
+                 complete=True):
+    """Validate a same-note re-stem's image mapping without changing files.
+
+    Prepare requires every old-stem file to be an exact rendered embed of the
+    renamed note, and no mapped new name to be embedded yet. Finalize
+    requires the republished note to embed every mapped new name and no old
+    one, with each new name holding a prepared copy.
+    """
+    owner = _restem_owner(attachments, owner_note, old_slug, new_slug)
+    if phase == "finalize":
+        stale = sorted(name for name in owner["embeds"]
+                       if _embedded_figure_tail(name, old_slug) is not None)
+        if stale:
+            raise ValueError("%s still embeds old image(s) %s; republish its "
+                             "embeds under the new stem before finalizing" %
+                             (owner["path"], ", ".join(stale)))
+    results = _plan_slug_rename(
+        attachments, old_slug, new_slug, sources=sources,
+        owner_note=owner_note, require_vault=True, restem=phase,
+        complete=complete)
+    failed = [row for row in results if not row.get("ok")]
+    if failed:
+        raise ValueError("image re-stem preflight failed: " + "; ".join(
+            "%s (%s)" % (row.get("from"), row.get("error"))
+            for row in failed))
+
+    mapping = []
+    for row in results:
+        old_name, new_name = row["from"], row["to"]
+        new_path = os.path.join(attachments, new_name)
+        if _same_file(os.path.join(attachments, old_name), new_path):
+            raise ValueError("%s and %s resolve to the same file; retain the "
+                             "existing names" % (old_name, new_name))
+        if phase == "prepare" and any(
+                _manifest_name_key(name) == _manifest_name_key(new_name)
+                for name in owner["embeds"]):
+            raise ValueError("%s already embeds %s; resolve that embed before "
+                             "re-stemming" % (owner["path"], new_name))
+        if phase == "finalize" and (os.path.islink(new_path)
+                                    or not os.path.isfile(new_path)):
+            raise ValueError("%s has no prepared copy; run prepare first"
+                             % new_name)
+        mapping.append({"from": old_name, "to": new_name})
+
+    dependency = _restem_dependency_status(
+        attachments, owner_note, old_slug, new_slug,
+        [item["from"] for item in mapping])
+    incomplete = [row for row in dependency["blockers"] if row.get("error")]
+    if incomplete and complete:
+        raise ValueError(_dependency_error(incomplete))
+    _validate_clipping_owner(owner)
+    return owner, mapping, dependency
+
+
+def _rename_plan(attachments, sources, owner_note, new_owner_note,
+                 old_slug, new_slug, phase):
+    """Plan one rename phase as a two-owner handoff or a same-note re-stem.
+
+    Returns the owners to revalidate, the mapping, the dependency report, a
+    probe that repeats that report for the same old names, and whether this
+    is a re-stem. The repair phase keeps an incomplete scan in the report.
+    """
+    complete = phase != "repair"
+    if _same_note_restem(owner_note, new_owner_note, old_slug, new_slug):
+        if not complete:
+            # Repair may run before or after the note republishes its own
+            # embeds under the new stem; plan for the state the note shows.
+            embeds = _restem_owner(attachments, owner_note, old_slug,
+                                   new_slug)["embeds"]
+            phase = ("prepare" if any(
+                _embedded_figure_tail(name, old_slug) is not None
+                for name in embeds) else "finalize")
+        owner, mapping, dependency = _restem_plan(
+            attachments, sources, owner_note, old_slug, new_slug, phase,
+            complete=complete)
+        names = [item["from"] for item in mapping]
+        return ((owner,), mapping, dependency,
+                lambda: _restem_dependency_status(
+                    attachments, owner_note, old_slug, new_slug, names), True)
+    old_owner, new_owner, mapping, dependency = _handoff_plan(
+        attachments, sources, owner_note, new_owner_note, old_slug, new_slug,
+        complete=complete)
+    return ((old_owner, new_owner), mapping, dependency,
+            lambda: dependency_status(attachments, owner_note, old_slug), False)
+
+
+def _rollback_new_publications(published, stage, stage_parent):
+    """Withdraw only new-name copies this prepare call published."""
+    failures = []
+    for index, (path, expected) in enumerate(reversed(published), 1):
+        rollback = os.path.join(stage, "rollback-new-%d" % index)
+        try:
+            os.mkdir(rollback)
+            remove_expected(
+                path, expected, _stable_regular_snapshot, rollback,
+                stage_parent=stage_parent,
+                recovery_prefix=".clipping-handoff-recovery-")
+        except (OSError, UnicodeError, ValueError) as exc:
+            failures.append("%s (%s)" % (path, exc))
+    return failures
+
+
+def prepare_slug_rename(attachments, old_slug, new_slug, *, sources,
+                        owner_note, new_owner_note, dry_run=False):
+    """Publish verified new-name image copies while retaining every old name."""
+    owners, mapping, dependency, probe, restem = _rename_plan(
+        attachments, sources, owner_note, new_owner_note, old_slug, new_slug,
+        "prepare")
+    rows = []
+    for item in mapping:
+        src = os.path.join(attachments, item["from"])
+        dst = os.path.join(attachments, item["to"])
+        action = "already-prepared" if os.path.lexists(dst) else (
+            "would-copy" if dry_run else "copy")
+        rows.append(dict(item, ok=True, action=action))
+    if dry_run:
+        return {"ok": True, "phase": "prepare", "restem": restem,
+                "old_slug": old_slug,
+                "new_slug": new_slug, "mapping": mapping,
+                "dependency": dependency, "results": rows,
+                "prepared": 0}
+
+    stage_parent = os.path.dirname(os.path.realpath(attachments))
+    stage = None   # made at the first copy: an image-less note needs none
+    published = []
+    try:
+        for index, (item, row) in enumerate(zip(mapping, rows), 1):
+            src = os.path.join(attachments, item["from"])
+            dst = os.path.join(attachments, item["to"])
+            for owner in owners:
+                _validate_clipping_owner(owner)
+            current = probe()
+            incomplete = [blocker for blocker in current["blockers"]
+                          if blocker.get("error")]
+            if incomplete:
+                raise ValueError(_dependency_error(incomplete))
+
+            old_mode = stat.S_IMODE(os.lstat(src).st_mode)
+            old_snapshot = _stable_regular_snapshot(src)
+            if os.path.lexists(dst):
+                if not _same_content(old_snapshot, _stable_regular_snapshot(dst)):
+                    raise ValueError("prepared destination %s is not byte-identical "
+                                     "to %s" % (dst, src))
+                row["action"] = "already-prepared"
+            else:
+                if stage is None:
+                    stage = tempfile.mkdtemp(
+                        prefix=".clipping-handoff-prepare-", dir=stage_parent)
+                staged = os.path.join(stage, "image-%d" % index)
+                copied = _stable_regular_snapshot(
+                    src, copy_to=staged, copy_mode=old_mode)
+                if copied != old_snapshot:
+                    raise ValueError("%s changed while its handoff copy was staged"
+                                     % src)
+                published_snapshot = publish_new(
+                    staged, dst, _stable_regular_snapshot, stage_parent,
+                    recovery_prefix=".clipping-handoff-recovery-")
+                published.append((dst, published_snapshot))
+                if (_stable_regular_snapshot(src) != old_snapshot
+                        or _stable_regular_snapshot(dst)[1:] != old_snapshot[1:]):
+                    raise ValueError("the published handoff copy of %s could not be "
+                                     "verified against its old source" % item["from"])
+                row["action"] = "copied"
+            row["sha256"] = old_snapshot[1]
+            row["bytes"] = old_snapshot[3]
+
+        for owner in owners:
+            _validate_clipping_owner(owner)
+        dependency = probe()
+        incomplete = [blocker for blocker in dependency["blockers"]
+                      if blocker.get("error")]
+        if incomplete:
+            raise ValueError(_dependency_error(incomplete))
+    except BaseException as exc:
+        failures = _rollback_new_publications(published, stage, stage_parent)
+        if failures:
+            raise ValueError(
+                "image handoff preparation failed (%s); rollback was incomplete. "
+                "Preserve and inspect %s and: %s" %
+                (exc, stage, "; ".join(failures))) from exc
+        if stage is not None:
+            shutil.rmtree(stage, ignore_errors=True)
+        raise
+    if stage is not None:
+        shutil.rmtree(stage, ignore_errors=True)
+    return {"ok": True, "phase": "prepare", "restem": restem,
+            "old_slug": old_slug,
+            "new_slug": new_slug, "mapping": mapping,
+            "dependency": dependency, "results": rows,
+            "prepared": sum(row["action"] == "copied" for row in rows)}
+
+
+#: Characters a repaired reference may introduce unescaped in every wikilink,
+#: Markdown, HTML and YAML form it can sit in; clipping slugs use only these.
+_PLAIN_REFERENCE_NAME = re.compile(r"[\w.-]+")
+
+
+def _reference_folder_resolves(path, note_dir, vault, folder):
+    """Whether a target path's folder part is ``folder``.
+
+    Obsidian writes a folder part vault-absolute, vault-relative or relative
+    to the linking note. Any other folder part may name another file.
+    """
+    directory = path.rpartition("/")[0]
+    candidates = [os.path.join(vault, directory.lstrip("/"))]
+    if not path.startswith("/"):
+        candidates.append(os.path.join(note_dir, directory))
+    for candidate in candidates:
+        try:
+            if os.path.samefile(os.path.normpath(candidate), folder):
+                return True
+        except OSError:
+            continue
+    return False
+
+
+#: Blockquote, callout and list-item markers that open a Markdown line.
+_CONTAINER_MARKERS = re.compile(
+    r"[ \t]*(?:(?:>[ \t]?)+[ \t]*|(?:[-*+]|\d{1,9}[.)])[ \t]+)*")
+#: A line after which a link reference definition starts a new block.
+_DEFINITION_MAY_FOLLOW = re.compile(
+    r"\[[^\]\r\n]+\]:|#{1,6}(?:[ \t]|$)|(?:-{3,}|\*{3,}|_{3,}|`{3,}|~{3,})"
+    r"[ \t]*$")
+
+
+def _context_problem(text, span, kind, frontmatter_end):
+    """Why a parsed target's surroundings may not render it as a link, or None.
+
+    The dependency scanner over-reports to fail closed; repair rewrites only
+    what certainly renders: an HTML-pattern value inside an open tag, a
+    definition that cannot continue a paragraph, nothing in a YAML comment.
+    """
+    line_start = text.rfind("\n", 0, span[0]) + 1
+    before = text[line_start:span[0]]
+    if span[0] < frontmatter_end and re.search(r"(?:^|[ \t])#", before):
+        return "may be inside a YAML comment"
+    if kind == "html":
+        tag = before.rfind("<")
+        if tag < 0 or not _HTML_ATTRIBUTE_PREFIX.fullmatch(before[tag:]):
+            return "not inside an HTML tag"
+    if kind == "definition" and line_start:
+        markers = _CONTAINER_MARKERS.match(before).group(0)
+        previous = text[text.rfind("\n", 0, line_start - 1) + 1:
+                        line_start - 1].rstrip("\r")
+        rest = previous[_CONTAINER_MARKERS.match(previous).end():]
+        # A new list item starts a block; any other line after paragraph
+        # text continues that paragraph as plain prose.
+        if (not re.search(r"[-*+0-9]", markers) and rest.strip()
+                and not _DEFINITION_MAY_FOLLOW.match(rest)):
+            return "may continue a paragraph"
+    return None
+
+
+def _reference_repairs(text, note_path, classify, renames, vault, unique_note,
+                       unique_image):
+    """Plan the in-place rewrite of one note's references to renamed files.
+
+    ``classify`` is the dependency parser's (`_dependency_classifier`), and
+    ``renames`` maps each name it returns to ``(new_name, folder, is_note)``.
+    Only the basename inside a parsed target is replaced, so the path form,
+    label, ``#heading`` or ``^block`` anchor, ``|size``, alt text and a note
+    link's own ``.md`` spelling keep their bytes. ``unique_note()`` and
+    ``unique_image()`` say whether a bare old note or image name, and its new
+    name, can each mean only the renamed file. A target is rewritten only
+    where the strict view also shows it, so code, math and comments are never
+    edited. Returns ``(edits, problems)``: ``edits`` maps each ``(start,
+    end)`` span in ``text`` to ``(new, line, before, after, anchor)``, where
+    ``anchor`` is a note link's ``#heading`` or ``#^block`` text or None, and
+    ``problems`` names every reference that cannot be rewritten
+    unambiguously.
+    """
+    split = split_frontmatter(text)
+    frontmatter_end = len(text) - len(split[1]) if split is not None else 0
+    strict_spans = {span for _t, _w, span, _k in _dependency_targets(
+        text, spans=True, strict=True) if span}
+    edits, problems = {}, []
+    for target, wikilink, span, kind in _dependency_targets(text, spans=True):
+        name = classify(target, wikilink)
+        if name is None:
+            continue
+        if span is None:
+            problems.append("%r (masked text inside the target)" % target.strip())
+            continue
+        # YAML's line, as split_frontmatter counts: a lone CR breaks a line.
+        line = len(yaml_lines(text[:span[0]] + "x"))
+        raw = text[span[0]:span[1]]
+        context = ("inside code, math or a comment"
+                   if span not in strict_spans
+                   else _context_problem(text, span, kind, frontmatter_end))
+        if context:
+            problems.append("line %d %r (%s)" % (line, raw, context))
+            continue
+        head = (re.split(r"(?<!\\)\||\\\|", raw, maxsplit=1)[0].split("#", 1)[0]
+                if wikilink else raw.split("#", 1)[0].split("?", 1)[0])
+        core = head.strip()
+        lead = len(head) - len(head.lstrip())
+        start = lead + max(core.rfind("/"), core.rfind("\\")) + 1
+        end = lead + len(core)
+        base = raw[start:end]
+        path = _local_target_path(target, wikilink=wikilink)
+        new_name, folder, is_note = renames[name]
+        # A note link keeps the `.md` only where it spelled one out; the old
+        # slug's own dots are not an extension.
+        new = new_name + (base[-3:] if is_note and _manifest_name_key(base)
+                          != _manifest_name_key(name[:-3]) else "")
+        if base != path.rpartition("/")[2].strip():
+            reason = "an encoded or irregular spelling"
+        elif not _PLAIN_REFERENCE_NAME.fullmatch(new):
+            reason = "%s would need escaping here" % new
+        elif "/" in path:
+            reason = (None if _reference_folder_resolves(
+                path, os.path.dirname(note_path), vault, folder)
+                else "its folder is not %s" % folder)
+        else:
+            reason = (None if (unique_note() if is_note else unique_image())
+                      else "another vault file has this name or the new name")
+        if reason:
+            problems.append("line %d %r (%s)" % (line, raw, reason))
+            continue
+        # A note link's `#heading` or `#^block` anchor, for the new-note check.
+        anchor = None
+        linked = (re.split(r"(?<!\\)\||\\\|", raw, maxsplit=1)[0]
+                  if wikilink else raw)
+        if is_note and "#" in linked:
+            anchor = linked.split("#", 1)[1]
+            anchor = (anchor if wikilink
+                      else urllib.parse.unquote(anchor)).strip() or None
+        edits[(span[0] + start, span[0] + end)] = (
+            new, line, raw, raw[:start] + new + raw[end:], anchor)
+    reached = 0
+    for start, end in sorted(edits):
+        if start < reached:
+            problems.append("overlapping references on line %d"
+                            % edits[(start, end)][1])
+        reached = max(reached, end)
+    return edits, problems
+
+
+def _canvas_repairs(text, canvas_path, classify, renames, vault, unique_note,
+                    unique_image):
+    """Plan the rewrite of one Obsidian Canvas board's renamed references.
+
+    A file card's or group background's vault path whose folder is the
+    renamed file's takes the new name. A text card's Markdown is planned as
+    a note's is (`_reference_repairs`). Only those JSON strings change, so
+    every other byte of the board stays. A note file card's ``subpath`` is
+    its edit's anchor. Returns ``(text, edits, problems)``: the planned
+    board, ``edits`` in board order with `_reference_repairs`'s values and
+    the board line, and every reference that cannot be rewritten
+    unambiguously.
+    """
+    organize = _load_organize()
+    try:
+        strings = organize._canvas_strings(text)
+    except (ValueError, RecursionError) as exc:
+        return text, {}, ["the board is not valid JSON (%s)" % exc]
+    data = json.loads(text)
+    nodes = data.get("nodes") if isinstance(data, dict) else None
+    subpaths = [node.get("subpath")
+                for node in (nodes if isinstance(nodes, list) else ())
+                if isinstance(node, dict) and node.get("type") == "file"
+                and isinstance(node.get("file"), str)]
+    # Duplicate keys can misalign the subpaths; their anchors go unchecked.
+    if len(subpaths) != sum(field == "file" for _m, _v, field in strings):
+        subpaths = []
+    subpaths = iter(subpaths)
+    changes, edits, problems = [], {}, []
+    for match, value, field in strings:
+        if field is None:
+            continue
+        line = text.count("\n", 0, match.start()) + 1
+        changed = value
+        if field == "text":
+            card, trouble = _reference_repairs(
+                value, canvas_path, classify, renames, vault, unique_note,
+                unique_image)
+            problems += ["line %d text card: %s" % (line, item)
+                         for item in trouble]
+            for (start, end), edit in sorted(card.items(), reverse=True):
+                changed = changed[:start] + edit[0] + changed[end:]
+                edits[(match.start(), start)] = (edit[0], line) + edit[2:]
+        else:
+            subpath = next(subpaths, None) if field == "file" else None
+            name = classify(value)
+            if name is None:
+                continue
+            new_name, folder, is_note = renames[name]
+            directory, _slash, base = value.rpartition("/")
+            new = new_name + (base[-3:] if is_note and _manifest_name_key(base)
+                              != _manifest_name_key(name[:-3]) else "")
+            try:
+                same = os.path.samefile(os.path.join(vault, directory), folder)
+            except OSError:
+                same = False
+            reason = ("an encoded or irregular spelling"
+                      if base != _local_target_basename(value)
+                      else None if same else "its folder is not %s" % folder)
+            if reason:
+                problems.append("line %d %r (%s)" % (line, value, reason))
+                continue
+            changed = value[:len(value) - len(base)] + new
+            anchor = (subpath[1:].strip() or None
+                      if is_note and isinstance(subpath, str)
+                      and subpath.startswith("#") else None)
+            edits[(match.start(), -1)] = (new, line, value, changed, anchor)
+        if changed != value:
+            changes.append((match, changed))
+    return (organize._splice_json_strings(text, changes) if changes else text,
+            edits, problems)
+
+
+_ATX_HEADING = re.compile(r"(?m)^[ \t]{0,3}#{1,6}[ \t]+(.*?)(?:[ \t]+#+)?[ \t]*\r?$")
+
+
+def _anchor_missing(anchor, text):
+    """Whether a ``#heading`` or ``#^block`` link anchor has no target in a note.
+
+    A block ID is matched exactly, as a trailing `` ^id`` or an ``^id`` line.
+    A heading (the last segment of ``#H1#H2``) is matched loosely, ignoring
+    case, spacing and the characters a link cannot carry, so the check
+    reports only an anchor that is clearly gone.
+    """
+    split = split_frontmatter(text)
+    body = text if split is None else split[1]
+    if anchor.startswith("^"):
+        block = anchor[1:].strip()
+        return not block or not re.search(
+            r"(?m)(?:^|[ \t])\^%s[ \t]*\r?$" % re.escape(block), body)
+
+    def key(value):
+        return " ".join(re.sub(r"[#^|\[\]:\\%]", " ", value).split()).casefold()
+
+    wanted = key(anchor.rsplit("#", 1)[-1])
+    return not any(key(match.group(1)) == wanted
+                   for match in _ATX_HEADING.finditer(body))
+
+
+#: A dated stock-research or market-research record, the investments
+#: plugin's immutable history (its ``market_notes.DAILY`` names).
+_DATED_RESEARCH_RECORD = re.compile(
+    r"\d{4}-\d{2}-\d{2}(?:-\d{6})?-(?:stock|market)-research\.md",
+    re.IGNORECASE)
+
+
+def _dated_research_record(path, vault):
+    """Whether ``path`` is a dated research record under ``Investments/``.
+
+    A linked-folder alias of the vault's ``Investments/`` counts as well, and
+    an unreadable vault root fails closed.
+    """
+    if not _DATED_RESEARCH_RECORD.fullmatch(
+            unicodedata.normalize("NFC", os.path.basename(path))):
+        return False
+    real_vault, real_note = os.path.realpath(vault), os.path.realpath(path)
+    for base, note in ((vault, path), (real_vault, real_note)):
+        top = os.path.relpath(note, base).split(os.sep)[0]
+        if _manifest_name_key(top) == "investments":
+            return True
+    try:
+        roots = [os.path.realpath(os.path.join(vault, name))
+                 for name in os.listdir(vault)
+                 if _manifest_name_key(name) == "investments"]
+    except OSError:
+        return True
+    return any(os.path.commonpath((real_note, root)) == root
+               for root in roots)
+
+
+def _note_stage_parent(vault, path):
+    """A parent on the note's filesystem for its private stage, or None."""
+    directory = os.path.realpath(os.path.dirname(path))
+    device = os.stat(directory).st_dev
+    for parent in (vault, os.path.dirname(directory)):
+        if os.stat(parent).st_dev == device:
+            return parent
+    return None
+
+
+def _publish_repaired_note(path, data, expected, vault):
+    """Replace a note with ``data`` only while it is the ``expected`` version.
+
+    Returns ``(None, [])`` after a verified publication, or the refusal and
+    every retained private stage or recovery path. The shared
+    ``replace_expected`` preserves a newer occupant and restores or names the
+    displaced predecessor on any failure.
+    """
+    try:
+        stage_parent = _note_stage_parent(vault, path)
+        if stage_parent is None:
+            return ("LinkUnavailable: no parent on the note's filesystem can "
+                    "hold its private stage"), []
+        stage = tempfile.mkdtemp(prefix=".clipping-link-repair-",
+                                 dir=stage_parent)
+    except OSError as exc:
+        return "cannot create its private stage: %s" % exc, []
+    try:
+        staged = os.path.join(stage, "note")
+        with open(staged, "xb") as fh:
+            fh.write(data)
+            fh.flush()
+            set_private_mode(fh, expected[2])
+            os.fsync(fh.fileno())
+        if _stable_regular_snapshot(staged)[1] != hashlib.sha256(data).hexdigest():
+            raise OSError(errno.EIO, "the staged repair does not hold the "
+                          "planned bytes", staged)
+        replace_expected(staged, path, expected, _stable_regular_snapshot,
+                         stage, stage_parent=stage_parent,
+                         recovery_prefix=".clipping-link-repair-recovery-")
+    except (OSError, UnicodeError, ValueError) as exc:
+        keep = (exc.keep_stage if isinstance(exc, PublicationConflict)
+                else True)
+        if not keep:
+            shutil.rmtree(stage, ignore_errors=True)
+        return str(exc), [item for item in (
+            getattr(exc, "recovery_path", None), stage if keep else None)
+            if item]
+    shutil.rmtree(stage, ignore_errors=True)
+    return None, []
+
+
+_LIST_ITEM = re.compile(r"[ \t]*-[ \t]+(.*)$")
+
+
+def _rewritten_source_copies(original, repaired, lines):
+    """Drop a ``sources:`` item that the repair turned into a copy of another.
+
+    An entry may cite both notes of a pending same-URL pair. Once the old
+    name becomes the new one, two items are equal, but one document is cited
+    in one form. ``lines`` holds the 1-based lines the repair rewrote. In a
+    block list the rewritten line goes and the item already there stays;
+    items that were already equal before the repair stay as found. Any other
+    list form keeps its items, and each new copy is reported instead.
+    Returns ``(text, removed, copies)``: ``removed`` lists ``{line, source}``
+    for each dropped line, ``copies`` each source a kept list now repeats.
+    """
+    split, before_split = split_frontmatter(repaired), split_frontmatter(original)
+    if split is None or before_split is None or not lines:
+        return repaired, [], []
+    try:
+        after = parse_source_fields(split[0]).get("sources")
+        before = parse_source_fields(before_split[0]).get("sources")
+        if not isinstance(after, list) or not isinstance(before, list):
+            return repaired, [], []
+        text_lines = yaml_lines(repaired, keepends=True)
+        old_lines = yaml_lines(original)
+        opening = next(i for i, line in enumerate(text_lines) if line.strip())
+        items, in_sources = [], False
+        for index in range(opening + 1, opening + 1 + len(split[0])):
+            line = text_lines[index].rstrip("\r\n")
+            if not line.strip() or line.lstrip(" \t").startswith("#"):
+                continue
+            item, old_item = _LIST_ITEM.match(line), _LIST_ITEM.match(
+                old_lines[index])
+            if in_sources and item and old_item:
+                items.append((index, parse_scalar(item[1])[0],
+                              parse_scalar(old_item[1])[0]))
+                continue
+            in_sources = bool(re.match(r"sources[ \t]*:[ \t]*(?:#.*)?$", line))
+    except (IndexError, StopIteration, ValueError):
+        return repaired, [], []
+    if [value for _index, value, _old in items] != after:
+        copies = sorted({value for value in after if after.count(value) > 1
+                         and after.count(value) > before.count(value)})
+        return repaired, [], copies
+    kept, dropped = {}, []
+    for index, value, old in items:
+        if index + 1 not in lines:
+            kept.setdefault(value, old)
+    for index, value, old in items:
+        if index + 1 not in lines:
+            continue
+        if value in kept and kept[value] != old:
+            dropped.append(index)
+        else:
+            kept.setdefault(value, old)
+    removed = [{"line": index + 1, "source": value}
+               for index, value, _old in items if index in dropped]
+    return ("".join(line for index, line in enumerate(text_lines)
+                    if index not in dropped), removed, [])
+
+
+def repair_slug_rename(attachments, old_slug, new_slug, *, sources,
+                       owner_note, new_owner_note, dry_run=False):
+    """Point other notes' old-name references at the prepared new names.
+
+    Runs after prepare, while every old and new name resolves, over the
+    dependency inventory `dependencies` reports; owner notes and dated
+    `Investments/` research records are not edited. Each note is
+    snapshotted before it is read and replaced only while it still matches.
+    A note that cannot be read, holds an ambiguous reference or changes
+    before publication stays unchanged and is a blocker. A Canvas board is
+    repaired the same way (`_canvas_repairs`).
+    """
+    owners, mapping, dependency, _probe, restem = _rename_plan(
+        attachments, sources, owner_note, new_owner_note, old_slug, new_slug,
+        "repair")
+    new_images = []
+    for item in mapping:
+        old_path = os.path.join(attachments, item["from"])
+        new_path = os.path.join(attachments, item["to"])
+        try:
+            prepared = _same_content(_stable_regular_snapshot(old_path),
+                                     _stable_regular_snapshot(new_path))
+        except (OSError, UnicodeError, ValueError):
+            prepared = False
+        if not prepared:
+            raise ValueError("%s is not the byte-identical prepared copy of %s; "
+                             "run prepare first" % (item["to"], item["from"]))
+        new_images.append(new_path)
+    vault = owners[0]["vault"]
+    image_names = [item["from"] for item in mapping]
+    renames = {item["from"]: (item["to"], attachments, False)
+               for item in mapping}
+    if not restem:
+        renames[old_slug + ".md"] = (
+            new_slug, os.path.dirname(owners[0]["path"]), True)
+    classify = _dependency_classifier(image_names, old_slug,
+                                      include_note=not restem)
+    note_unique, image_unique = [], []
+
+    def unique_note():
+        """Whether the old and the new note name each name one vault note."""
+        if not note_unique:
+            counts = {_manifest_name_key(slug + ".md"): 0
+                      for slug in (old_slug, new_slug)}
+            try:
+                for path in _vault_markdown_files(vault):
+                    key = _manifest_name_key(os.path.basename(path))
+                    if key in counts:
+                        counts[key] += 1
+                note_unique.append(all(count == 1 for count in counts.values()))
+            except (OSError, ValueError):
+                note_unique.append(False)
+        return note_unique[0]
+
+    def unique_image():
+        """Whether no vault file outside the attachments shares a mapped name."""
+        if not image_unique:
+            keys = {_manifest_name_key(item[side])
+                    for item in mapping for side in ("from", "to")}
+            try:
+                image_unique.append(not any(
+                    _manifest_name_key(os.path.basename(path)) in keys
+                    and not os.path.samefile(os.path.dirname(path), attachments)
+                    for path in _vault_files(vault)))
+            except (OSError, ValueError):
+                image_unique.append(False)
+        return image_unique[0]
+
+    def repair(path, copy, notes):
+        """Return ``(status, edits, reason, recovery)`` for one note.
+
+        Status ``halt`` means an owner note or prepared image changed, so no
+        later note may be published either. ``notes`` receives the
+        ``sources:`` copies the rewrite removed or left.
+        """
+        try:
+            if not restem and _same_logical_note(path, owners[1]["path"]):
+                return ("blocked", {}, "the new owner note references old "
+                        "names; republish it", [])
+            # A note reached through a vault folder link is part of the
+            # vault, as in the scan; a leaf symlink fails the snapshot below.
+            if not _inside_existing_directory(path, vault):
+                return ("blocked", {}, "it is not inside the vault", [])
+            if _dated_research_record(path, vault):
+                return ("blocked", {}, "a dated Investments/ research record "
+                        "is immutable; the old names stay in place", [])
+            expected = _stable_regular_snapshot(path, copy_to=copy,
+                                                copy_mode=0o600)
+            with open(copy, "rb") as fh:
+                raw = fh.read()
+            bom = b"\xef\xbb\xbf" if raw.startswith(b"\xef\xbb\xbf") else b""
+            text = raw[len(bom):].decode("utf-8")
+        except (OSError, UnicodeError, ValueError) as exc:
+            return "blocked", {}, "cannot snapshot and read it: %s" % exc, []
+        canvas = _is_canvas(path)
+        if canvas:
+            repaired, edits, problems = _canvas_repairs(
+                text, path, classify, renames, vault, unique_note, unique_image)
+        else:
+            edits, problems = _reference_repairs(
+                text, path, classify, renames, vault, unique_note, unique_image)
+        if problems:
+            return ("blocked", {}, "ambiguous references, all left unchanged: "
+                    + "; ".join(problems), [])
+        if not canvas:
+            repaired = text
+            for (start, end), edit in sorted(edits.items(), reverse=True):
+                repaired = repaired[:start] + edit[0] + repaired[end:]
+            repaired, removed, copies = _rewritten_source_copies(
+                text, repaired, {edit[1] for edit in edits.values()})
+            if removed:
+                notes["deduplicated"] = removed
+            if copies:
+                notes["duplicate_sources"] = copies
+        left = (_canvas_dependency_names if canvas
+                else _markdown_dependency_names)(
+                    repaired, image_names, old_slug, include_note=not restem)
+        if left:
+            return ("blocked", {}, "references to %s could not be located for "
+                    "rewriting" % ", ".join(left), [])
+        if not edits:
+            return "unchanged", {}, None, []
+        if dry_run:
+            return "would-rewrite", edits, None, []
+        try:
+            for owner in owners:
+                _validate_clipping_owner(owner)
+            for image in new_images:
+                if os.path.islink(image) or not os.path.isfile(image):
+                    raise ValueError("prepared image %s disappeared" % image)
+        except (OSError, UnicodeError, ValueError) as exc:
+            return ("halt", {}, "not rewritten: the handoff changed during "
+                    "the repair (%s); re-run it" % exc, [])
+        try:
+            current = _stable_regular_snapshot(path)
+        except (OSError, UnicodeError, ValueError):
+            current = None
+        if current != expected:
+            return ("blocked", {}, "it changed after its snapshot and was "
+                    "preserved", [])
+        error, recovery = _publish_repaired_note(
+            path, bom + repaired.encode("utf-8"), expected, vault)
+        if error:
+            return "blocked", {}, "not rewritten: %s" % error, recovery
+        return "rewritten", edits, None, []
+
+    rows, halted = [], None
+    with tempfile.TemporaryDirectory(prefix="clipping_repair.") as scratch:
+        for index, blocker in enumerate(dependency["blockers"], 1):
+            row = {"path": blocker["path"], "status": "blocked",
+                   "references": []}
+            rows.append(row)
+            reason = blocker.get("error") or halted
+            if reason is None:
+                notes = {}
+                status, edits, reason, recovery = repair(
+                    blocker["path"], os.path.join(scratch, "%d.md" % index),
+                    notes)
+                if status == "halt":
+                    status, halted = "blocked", reason
+                row["status"] = status
+                # A sources: item the rewrite made a copy of another one.
+                if status in ("rewritten", "would-rewrite"):
+                    row.update(notes)
+                planned = [edits[span] for span in sorted(edits)]
+                row["references"] = [
+                    {"line": line, "from": before, "to": after}
+                    for _new, line, before, after, _anchor in planned]
+                # Report-only: a note link whose anchor the new note lacks.
+                # A file card's path holds no `#`; its anchor is appended.
+                missing = [{"line": line, "reference": after if "#" in after
+                            else "%s#%s" % (after, anchor)}
+                           for _new, line, _before, after, anchor in planned
+                           if anchor and _anchor_missing(
+                               anchor, owners[1]["text"])]
+                if missing:
+                    row["missing_anchors"] = missing
+                if recovery:
+                    row["recovery"] = recovery
+            if reason:
+                row["reason"] = reason
+                row["dependencies"] = blocker.get("references", [])
+    blocked = sum(row["status"] == "blocked" for row in rows)
+    return {"ok": not blocked, "phase": "repair", "restem": restem,
+            "old_slug": old_slug, "new_slug": new_slug, "mapping": mapping,
+            "results": rows,
+            "rewritten": sum(row["status"] == "rewritten" for row in rows),
+            "blocked": blocked}
+
+
+def _restore_retired_images(retired, stage_parent):
+    """Restore conditionally retired old images; retain stages on any conflict."""
+    failures = []
+    for src, expected, stage in reversed(retired):
+        displaced = os.path.join(stage, ".atomic-displaced")
+        try:
+            if _stable_regular_snapshot(displaced) != expected:
+                raise ValueError("private retired snapshot changed")
+            if os.path.lexists(src):
+                if _stable_regular_snapshot(src) != expected:
+                    raise ValueError("public old-image path was reoccupied by a "
+                                     "different file")
+                # remove_expected can detect a late conflict after it has
+                # already restored the expected public inode. Its retained
+                # private hard link is cleanup state, not an unrestored image.
+                continue
+            move_noreplace(
+                displaced, src, expected=file_identity(displaced),
+                stage_parent=stage_parent)
+            if _stable_regular_snapshot(src) != expected:
+                raise ValueError("restored public image differs from its snapshot")
+        except (OSError, UnicodeError, ValueError) as exc:
+            failures.append("%s (recovery stage %s: %s)" % (src, stage, exc))
+    if not failures:
+        for _src, _expected, stage in retired:
+            shutil.rmtree(stage, ignore_errors=True)
+    return failures
+
+
+def finalize_slug_rename(attachments, old_slug, new_slug, *, sources,
+                         owner_note, new_owner_note, dry_run=False):
+    """Retire only exact old images after every old dependency has disappeared."""
+    owners, mapping, dependency, probe, restem = _rename_plan(
+        attachments, sources, owner_note, new_owner_note, old_slug, new_slug,
+        "finalize")
+    if not dependency["ok"]:
+        raise ValueError(_probe_error(dependency))
+
+    snapshots = []
+    rows = []
+    for item in mapping:
+        src = os.path.join(attachments, item["from"])
+        dst = os.path.join(attachments, item["to"])
+        old_snapshot = _stable_regular_snapshot(src)
+        new_snapshot = _stable_regular_snapshot(dst)
+        if not _same_content(old_snapshot, new_snapshot):
+            raise ValueError("%s is not the verified byte-identical prepared copy "
+                             "of %s" % (dst, src))
+        snapshots.append((src, dst, old_snapshot, new_snapshot))
+        rows.append(dict(item, ok=True,
+                         action="would-retire" if dry_run else "retire",
+                         sha256=old_snapshot[1], bytes=old_snapshot[3]))
+    if dry_run:
+        return {"ok": True, "phase": "finalize", "restem": restem,
+                "old_slug": old_slug,
+                "new_slug": new_slug, "mapping": mapping,
+                "dependency": dependency, "results": rows, "retired": 0}
+
+    stage_parent = os.path.dirname(os.path.realpath(attachments))
+    retired = []
+    try:
+        for src, dst, old_snapshot, new_snapshot in snapshots:
+            for owner in owners:
+                _validate_clipping_owner(owner)
+            current = probe()
+            if not current["ok"]:
+                raise ValueError(_probe_error(current))
+            if (_stable_regular_snapshot(src) != old_snapshot
+                    or _stable_regular_snapshot(dst) != new_snapshot):
+                raise ValueError("an old or new image changed after finalization "
+                                 "preflight")
+            stage = tempfile.mkdtemp(prefix=".clipping-handoff-retire-",
+                                     dir=stage_parent)
+            try:
+                removed = remove_expected(
+                    src, old_snapshot, _stable_regular_snapshot, stage,
+                    stage_parent=stage_parent,
+                    recovery_prefix=".clipping-handoff-recovery-")
+            except BaseException:
+                if os.path.lexists(os.path.join(stage, ".atomic-displaced")):
+                    retired.append((src, old_snapshot, stage))
+                else:
+                    shutil.rmtree(stage, ignore_errors=True)
+                raise
+            if not removed:
+                shutil.rmtree(stage, ignore_errors=True)
+                raise ValueError("old image disappeared before retirement: %s" % src)
+            retired.append((src, old_snapshot, stage))
+            if _stable_regular_snapshot(dst) != new_snapshot:
+                raise ValueError("new image changed while its old duplicate was "
+                                 "being retired: %s" % dst)
+            current = probe()
+            if not current["ok"]:
+                raise ValueError(_probe_error(current))
+
+        for owner in owners:
+            _validate_clipping_owner(owner)
+        dependency = probe()
+        if not dependency["ok"]:
+            raise ValueError(_probe_error(dependency))
+        for _src, dst, _old_snapshot, new_snapshot in snapshots:
+            if _stable_regular_snapshot(dst) != new_snapshot:
+                raise ValueError("new image changed before finalization completed: %s"
+                                 % dst)
+    except BaseException as exc:
+        failures = _restore_retired_images(retired, stage_parent)
+        if failures:
+            raise ValueError(
+                "image handoff finalization failed (%s); rollback was incomplete. "
+                "Preserve every public image and: %s" %
+                (exc, "; ".join(failures))) from exc
+        raise
+    for _src, _expected, stage in retired:
+        shutil.rmtree(stage, ignore_errors=True)
+    for row in rows:
+        row["action"] = "retired"
+    return {"ok": True, "phase": "finalize", "restem": restem,
+            "old_slug": old_slug,
+            "new_slug": new_slug, "mapping": mapping,
+            "dependency": dependency, "results": rows,
+            "retired": len(rows)}
+
+
+def _note_web_origin(data, what, *, legacy_fix=None):
+    """The normalized web origin of complete note bytes, or a refusal.
+
+    ``sources:`` item 1 decides. A note with only a legacy scalar ``source:``
+    is refused by name, with ``legacy_fix`` as the advice. A marked legacy
+    research extract never qualifies.
+    """
+    try:
+        text = data.decode("utf-8-sig")
+    except UnicodeDecodeError as exc:
+        raise ValueError("%s is not complete UTF-8: %s" % (what, exc)) from exc
+    split = split_frontmatter(text)
+    try:
+        fields = parse_source_fields(split[0]) if split is not None else None
+    except ValueError:
+        fields = None
+    if fields is None:
+        raise ValueError("%s has no closed frontmatter with readable source "
+                         "fields" % what)
+    if "sources" in fields:
+        origin = (fields["sources"] or [None])[0]
+    elif fields.get("source"):
+        raise ValueError("%s has only a legacy scalar source:, not a current "
+                         "sources: list%s" % (
+                             what, "; " + legacy_fix if legacy_fix else ""))
+    else:
+        origin = None
+    normalized = normalize_url(origin) if origin else None
+    if not normalized:
+        raise ValueError("%s does not have a web URL as its first current "
+                         "sources item" % what)
+    if is_research_extract_text(text):
+        raise ValueError("%s is a wiki-add research extract; clipping-clean "
+                         "never reprocesses or renames one" % what)
+    return normalized
+
+
+def _read_note_bytes(path, what):
+    """Complete bytes of one regular, non-symlink file."""
+    try:
+        if not stat.S_ISREG(os.lstat(path).st_mode):
+            raise ValueError("%s is a symlink or non-regular file: %r"
+                             % (what, path))
+        flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
+        flags |= getattr(os, "O_NONBLOCK", 0)
+        with os.fdopen(os.open(path, flags), "rb") as fh:
+            if not stat.S_ISREG(os.fstat(fh.fileno()).st_mode):
+                raise ValueError("%s changed into a non-regular file: %r"
+                                 % (what, path))
+            return fh.read()
+    except OSError as exc:
+        raise ValueError("%s is missing or unreadable: %s" % (what, exc)) from exc
+
+
+def _publish_note_key(vault, path, slug, what):
+    """The vault-relative key of ``path``, which must be Articles/<slug>.md."""
+    try:
+        key = publish_files.vault_key(vault, os.path.abspath(os.fspath(path)))
+    except publish_files.InputError as exc:
+        raise ValueError("%s: %s" % (what, exc)) from exc
+    wanted = "Articles/" + slug + ".md"
+    if key != wanted:
+        raise ValueError("%s must be <vault>/%s for this slug, not %r"
+                         % (what, wanted, path))
+    return key
+
+
+def publish_clipping_note(vault, snapshots, draft, old_slug, new_slug, *,
+                          owner_note, new_owner_note, dry_run=False):
+    """Publish a reprocessed clipping note under a changed name.
+
+    The old note's ``publish_files.py snapshot`` record is the expected
+    version, never a fresh snapshot. A changed slug publishes the draft
+    exclusively at a free ``Articles/<new_slug>.md`` recorded ``absent`` in
+    the same file, with the old note's recorded mode, and leaves the old note
+    in place. The draft must carry the old note's web origin. The old note
+    stays the image phases' owner, so it needs a current ``sources:`` list,
+    and its image plan must pass before anything is published. A new slug
+    that differs from the old one only by case or Unicode normalization is
+    not a changed slug: the note keeps its spelling, and a same-name rewrite
+    belongs to ``publish_files.py publish``. Before the note, it publishes
+    the hidden ``Articles/.<new_slug>.handoff.json`` naming the old and the
+    new note (`_handoff_record`). A refusal before the publication call
+    removes the private stage; a failed publication keeps and reports it.
+    If the note does not go public, the run withdraws the record it wrote.
+    """
+    validate_slug(old_slug, "--old-slug")
+    validate_slug(new_slug, "--new-slug")
+    if old_slug == new_slug:
+        raise ValueError("--old-slug and --new-slug are the same spelling; "
+                         "publish a same-name rewrite with publish_files.py "
+                         "publish")
+    if _manifest_name_key(old_slug + ".md") == _manifest_name_key(
+            new_slug + ".md"):
+        raise ValueError("--new-slug differs from --old-slug only by case or "
+                         "Unicode normalization; keep the note's existing "
+                         "spelling and publish a same-name rewrite with "
+                         "publish_files.py publish")
+    if not vault or not os.path.isdir(vault):
+        raise ValueError("--vault is not a directory: %r" % (vault,))
+    pair = (os.path.abspath(vault), os.path.realpath(vault))
+    old_key = _publish_note_key(pair, owner_note, old_slug, "--owner-note")
+    new_key = _publish_note_key(pair, new_owner_note, new_slug,
+                                "--new-owner-note")
+    articles = os.path.join(pair[1], "Articles")
+    if not os.path.isdir(articles):
+        raise ValueError("%s is not a directory" % articles)
+    old_target = os.path.join(articles, old_slug + ".md")
+    new_name = new_slug + ".md"
+    new_target = os.path.join(articles, new_name)
+    _refuse_recorded_new_note(old_target, old_slug)
+    handoff = _handoff_record(articles, new_slug)
+    if handoff is not None and [_manifest_name_key(name) for name in handoff] \
+            != [_manifest_name_key(old_slug + ".md"), _manifest_name_key(new_name)]:
+        if not os.path.lexists(os.path.join(articles, handoff[0])):
+            raise ValueError(
+                "Articles/%s records a finished handoff from %s to %s, whose "
+                "old note is gone; remove that record with publish_files.py "
+                "snapshot and remove, then rerun"
+                % (_handoff_record_name(new_slug), *handoff))
+        raise ValueError("Articles/%s records a handoff from %s to %s; return "
+                         "to the naming decision" % (
+                             _handoff_record_name(new_slug), *handoff))
+
+    try:
+        records = publish_files.load_snapshots(snapshots, pair)
+    except publish_files.InputError as exc:
+        raise ValueError(str(exc)) from exc
+    old_record = records.get(old_key)
+    if old_record is None or old_record.get("state") != "file":
+        raise ValueError("%s has no recorded file version in %s; record it "
+                         "with publish_files.py snapshot before reading it"
+                         % (old_key, snapshots))
+
+    draft = os.fspath(draft)
+    if not os.path.isabs(draft):
+        raise ValueError("--draft must be an absolute scratch path: %r" % draft)
+    if _at_or_inside_existing_directory(draft, pair[1]):
+        raise ValueError("--draft must be a scratch file outside the vault: %r"
+                         % draft)
+    data = _read_note_bytes(draft, "--draft")
+    digest = hashlib.sha256(data).hexdigest()
+    report = {"ok": False, "phase": "publish-note", "old_slug": old_slug,
+              "new_slug": new_slug, "old_note": old_key, "new_note": new_key,
+              "sha256": digest,
+              "handoff_record": "Articles/" + _handoff_record_name(new_slug)}
+
+    try:
+        listing = os.listdir(articles)
+    except OSError as exc:
+        raise ValueError("cannot inventory %s: %s" % (articles, exc)) from exc
+    wanted = _manifest_name_key(new_name)
+    occupants = sorted(name for name in listing
+                       if _manifest_name_key(name) == wanted)
+    if occupants == [new_name] and not os.path.islink(new_target):
+        try:
+            current = regular_file_snapshot(new_target)
+        except (OSError, UnicodeError):
+            current = None
+        if current is not None and (current.digest, current.size) == (
+                digest, len(data)):
+            # A rerun after success: the exact spelling already holds the draft.
+            report.update(ok=True, action="unchanged", file_mode=current.mode,
+                          detail="%s already equals the draft" % new_key)
+            return report
+
+    status, detail = publish_files.compare(
+        old_record, publish_files.observe(old_target))
+    if status != "unchanged":
+        raise ValueError("%s %s after its snapshot (%s); retain the draft, "
+                         "re-record the note with snapshot --replace and "
+                         "redo the reprocess from its current bytes"
+                         % (old_key, status, detail))
+    old_bytes = _read_note_bytes(old_target, "the old note")
+    if (hashlib.sha256(old_bytes).hexdigest(), len(old_bytes)) != (
+            old_record["digest"], old_record["size"]):
+        raise ValueError("%s changed after its snapshot; retain the draft and "
+                         "redo the reprocess from its current bytes" % old_key)
+    # The old note stays the owner every image phase loads, and they accept
+    # only a current sources: list.
+    origin = _note_web_origin(
+        old_bytes, "the old note %s" % old_key,
+        legacy_fix="migrate it first: publish a same-name rewrite with "
+                   "publish_files.py publish that turns it into a one-item "
+                   "sources: list, re-record it with snapshot --replace, "
+                   "then rerun")
+    if _note_web_origin(data, "--draft") != origin:
+        raise ValueError("--draft does not carry the old note's web origin as "
+                         "its first current sources item")
+
+    mode = old_record["mode"]
+    if occupants:
+        raise ValueError(
+            "Articles/%s is occupied by %s under portable naming; return "
+            "to the naming decision" % (new_name, ", ".join(occupants)))
+    new_record = records.get(new_key)
+    if new_record is None or new_record.get("state") != "absent":
+        raise ValueError("%s has no recorded absent state in %s; record "
+                         "it with publish_files.py snapshot once the slug "
+                         "is settled" % (new_key, snapshots))
+    status, detail = publish_files.compare(
+        new_record, publish_files.observe(new_target))
+    if status != "unchanged":
+        raise ValueError("%s %s after its snapshot (%s); return to the "
+                         "naming decision" % (new_key, status, detail))
+    # Prepare runs only once the new note is public. Refuse every
+    # old-note image blocker it would raise while nothing is published.
+    failed = _failed_plan_rows(_plan_slug_rename(
+        os.path.join(pair[1], "Sources", "Images"), old_slug, new_slug,
+        sources=os.path.join(pair[1], "Sources", "PDFs"),
+        owner_note=old_target, require_vault=True))
+    if failed:
+        raise ValueError("image handoff preflight failed: %s; nothing was "
+                         "published" % failed)
+
+    articles_real = os.path.realpath(articles)
+    stage_location = os.path.dirname(articles_real)
+    if os.stat(stage_location).st_dev != os.stat(articles_real).st_dev:
+        raise ValueError("LinkUnavailable: no parent of %s on its filesystem "
+                         "can hold the private stage" % articles_real)
+    report["file_mode"] = mode
+    if dry_run:
+        report.update(ok=True, action="would-create", detail=(
+            "would publish the handoff record and the draft at a free "
+            "destination with the old note's recorded mode; the old note "
+            "stays in place"))
+        return report
+
+    stage_parent = tempfile.mkdtemp(prefix=".clipping-note-publish-",
+                                    dir=stage_location)
+    stage_dir = tempfile.mkdtemp(prefix="note-", dir=stage_parent)
+    staged = os.path.join(stage_dir, "staged")
+    staged_record = os.path.join(stage_dir, "record")
+    record_target = os.path.join(articles, _handoff_record_name(new_slug))
+    attempted = False
+    record_published = published = None
+    try:
+        for path, payload in ((staged, data), (staged_record, (json.dumps(
+                {"old_note": old_key, "new_note": new_key},
+                ensure_ascii=False) + "\n").encode("utf-8"))):
+            with open(path, "xb") as fh:
+                fh.write(payload)
+                fh.flush()
+                set_private_mode(fh, mode)
+                os.fsync(fh.fileno())
+        status, detail = publish_files.compare(
+            old_record, publish_files.observe(old_target))
+        if status != "unchanged":
+            raise PublicationConflict(
+                "%s %s before publication (%s)" % (old_key, status, detail))
+        attempted = True
+        if handoff is None:
+            record_published = publish_new(
+                staged_record, record_target, regular_file_snapshot,
+                stage_parent, recovery_prefix=".clipping-note-recovery-")
+        published = publish_new(
+            staged, new_target, regular_file_snapshot, stage_parent,
+            recovery_prefix=".clipping-note-recovery-")
+        after = regular_file_snapshot(new_target)
+        if after != published or (after.digest, after.size) != (
+                digest, len(data)):
+            raise PublicationConflict(
+                "%s does not read back as the draft bytes" % new_key,
+                keep_stage=True)
+    except (OSError, UnicodeError) as exc:
+        report.update(action="failed", error=type(exc).__name__,
+                      detail=str(exc))
+        if not attempted:
+            # Nothing was linked anywhere public: the stage is only our copy.
+            shutil.rmtree(stage_dir, ignore_errors=True)
+            with contextlib.suppress(OSError):
+                os.rmdir(stage_parent)
+            report["detail"] += "; nothing was published"
+            return report
+        report.update(stage_dir=stage_dir, stage_parent=stage_parent)
+        if record_published is not None and published is None:
+            # The note never went public, so this run's record names no
+            # pending handoff. Withdraw only the exact record it wrote.
+            withdraw = tempfile.mkdtemp(prefix="record-", dir=stage_parent)
+            try:
+                remove_expected(record_target, record_published,
+                                regular_file_snapshot, withdraw,
+                                stage_parent=stage_parent,
+                                recovery_prefix=".clipping-note-recovery-")
+            except (OSError, UnicodeError) as cleanup:
+                report["detail"] += "; the handoff record stays: %s" % cleanup
+            else:
+                shutil.rmtree(withdraw, ignore_errors=True)
+                report["detail"] += "; the handoff record was withdrawn"
+        recovery = getattr(exc, "recovery_path", None)
+        if recovery:
+            report["recovery_path"] = recovery
+        return report
+    shutil.rmtree(stage_dir, ignore_errors=True)
+    with contextlib.suppress(OSError):
+        os.rmdir(stage_parent)
+    report.update(ok=True, action="created", detail=(
+        "created at the free destination with the old note's recorded mode; "
+        "the unchanged old note still resolves"))
+    return report
+
+
+class _FakeResponse:
+    """Just enough of an `http.client.HTTPResponse` for `_stream_to_file`.
+
+    The download path is exercised WITHOUT a socket: this is the only way to
+    test the byte cap, the wall-clock deadline and the truncation check at all,
+    since each of them needs a server that misbehaves in a specific way, and a
+    self-test that reaches the network is a self-test that fails on a train.
+    `read` raises rather than returning data, because the choice of `read1` is
+    load-bearing (a server dripping one byte at a time never returns from a
+    `read(CHUNK)`, so the deadline below it is never reached).
+    """
+
+    def __init__(self, chunks, headers=None, status=200, reason="OK"):
+        self._chunks = list(chunks)
+        self.headers = dict(headers or {})
+        self.status = status
+        self.reason = reason
+        self.read_count = 0
+        self.closed = False
+
+    def read1(self, _n=None):
+        self.read_count += 1
+        return self._chunks.pop(0) if self._chunks else b""
+
+    def read(self, _n=None):
+        raise AssertionError("_stream_to_file must read1(), not read()")
+
+    def close(self):
+        self.closed = True
+
+
+class _FakeConnection:
+    """Connection lifetime probe for offline redirect transport tests."""
+
+    def __init__(self):
+        self.closed = False
+
+    def close(self):
+        self.closed = True
+
+
+#: The smallest valid PNG, for the paths that need real image bytes.
+_PNG = (b"\x89PNG\r\n\x1a\n\x00\x00\x00\rIHDR\x00\x00\x00\x01\x00\x00\x00\x01"
+        b"\x08\x06\x00\x00\x00\x1f\x15\xc4\x89\x00\x00\x00\nIDATx\x9cc\x00"
+        b"\x01\x00\x00\x05\x00\x01\r\n-\xb4\x00\x00\x00\x00IEND\xaeB`\x82")
+
+
+def run_self_test():
+    """The guards, run against the inputs they exist to refuse.
+
+    Everything here is offline. The scheme and private-host guards are called
+    directly, the streaming limits are driven by `_FakeResponse`, and the one
+    end-to-end download is a `data:` URI, which opens no socket. Nothing is
+    written outside a temp directory, which is removed on the way out.
+    """
+    from pathlib import Path
+    from unittest.mock import PropertyMock, patch
+
+    cases = []
+
+    def check(label, got, want):
+        cases.append((label, got == want, got, want))
+
+    def raises(label, fn, *a, **kw):
+        """A guard is only a guard if it refuses; record WHAT it refused with."""
+        try:
+            fn(*a, **kw)
+        except (ValueError, TypeError, TimeoutError, urllib.error.HTTPError,
+                argparse.ArgumentTypeError) as exc:
+            cases.append((label, True, type(exc).__name__, "refused"))
+            return str(exc)
+        except Exception as exc:                       # noqa: BLE001
+            cases.append((label, False, "%s: %s" % (type(exc).__name__, exc),
+                          "refused"))
+            return ""
+        cases.append((label, False, "accepted", "refused"))
+        return ""
+
+    phase_stderr = io.StringIO()
+    try:
+        with contextlib.redirect_stderr(phase_stderr):
+            main([
+                "rename", "--attachments", "unused-images",
+                "--sources", "unused-pdfs", "--owner-note", "unused.md",
+                "--old-slug", "Old_Slug_2025",
+                "--new-slug", "New_Slug_2026",
+            ])
+        missing_phase_exit = None
+    except SystemExit as exc:
+        missing_phase_exit = exc.code
+    check("rename CLI refuses an omitted phase before touching paths",
+          (missing_phase_exit, "--phase" in phase_stderr.getvalue()),
+          (2, True))
+
+    # --- sniff_extension: bytes beat Content-Type beat the URL --------------
+    exercised_extensions = set()
+    for label, head, ct, url, want in (
+            ("PNG magic", _PNG, None, None, "png"),
+            ("JPEG magic", b"\xff\xd8\xff\xe0JFIF", None, None, "jpg"),
+            ("GIF87a", b"GIF87a\x01\x00", None, None, "gif"),
+            ("GIF89a", b"GIF89a\x01\x00", None, None, "gif"),
+            ("WEBP", b"RIFF\x24\x00\x00\x00WEBPVP8 ", None, None, "webp"),
+            ("AVIF", b"\x00\x00\x00 ftypavif\x00\x00", None, None, "avif"),
+            ("AVIF with a generic MIAF major brand",
+             b"\x00\x00\x00\x1cftypmif1\x00\x00\x00\x00avifmif1", None,
+             None, "avif"),
+            ("BMP", b"BM\x36\x00", None, None, "bmp"),
+            ("SVG, xml declaration first", b"<?xml version='1.0'?>\n<svg />",
+             None, None, "svg"),
+            ("SVG, bare root", b"<svg xmlns='...'></svg>", None, None, "svg"),
+            # the disagreement cases: the bytes are the truth
+            ("PNG bytes, jpeg Content-Type", _PNG, "image/jpeg", None, "png"),
+            ("PNG bytes, .jpg URL", _PNG, None, "http://x/a.jpg", "png"),
+            ("PNG bytes, text/html Content-Type", _PNG, "text/html",
+             "http://x/a", "png"),
+            # No recognized image bytes: neither header nor URL can rescue it.
+            ("Content-Type png", b"\x00\x01\x02\x03", "image/png", None, None),
+            ("Content-Type with a charset", b"\x00\x01", "image/png; charset=x",
+             None, None),
+            ("Content-Type jpeg without JPEG bytes", b"\x00\x01", "image/jpeg",
+             None, None),
+            ("Content-Type uppercase", b"\x00\x01", "IMAGE/PNG", None, None),
+            ("unmapped image/*, URL extension", b"\x00\x01", "image/tiff",
+             "http://x/a.tiff", None),
+            ("unmapped image/*, no URL", b"\x00\x01", "image/heif", None, None),
+            ("octet-stream, .png URL", b"\x00\x01", "application/octet-stream",
+             "http://x/a.png", None),
+            ("octet-stream, .jpeg URL", b"\x00\x01",
+             "application/octet-stream", "http://x/a.jpeg", None),
+            ("octet-stream, uppercase URL extension", b"\x00\x01",
+             "application/octet-stream", "http://x/A.PNG", None),
+            ("octet-stream, URL extension behind a query", b"\x00\x01",
+             "application/octet-stream", "http://x/a.webp?w=800", None),
+            ("octet-stream, no usable URL extension", b"\x00\x01",
+             "application/octet-stream", "http://x/a", None),
+            ("no Content-Type, no extension", b"\x00\x01", None, "http://x/a",
+             None),
+            # NOT images: a failure, so the model writes the documented
+            # placeholder instead of embedding something Obsidian cannot render
+            ("an HTML error page", b"<!DOCTYPE html><html>", "text/html",
+             "http://x/a.png", None),
+            ("an HTML page with no doctype", b"<html><body>nope",
+             "text/html", "http://x/a.png", None),
+            ("a JSON error body", b'{"error": "not found"}',
+             "application/json", "http://x/a.png", None),
+            ("a PDF", b"%PDF-1.7\n", "application/pdf", "http://x/a.png", None),
+            ("plain text", b"nope", "text/plain", "http://x/a.png", None),
+            # --- the LYING `image/*` header ---------------------------------
+            # A mapped image/* Content-Type used to win outright, so every one
+            # of these was written into Sources/Images as a .png and reported
+            # `"ok": true, "failed": 0` — the exact thing the image guards
+            # promise cannot happen.
+            ("a JSON body served as image/png", b'{"error": "not found"}',
+             "image/png", "http://x/a.png", None),
+            ("plain text served as image/png", b"nope, not an image",
+             "image/png", "http://x/a.png", None),
+            ("a PDF served as image/jpeg", b"%PDF-1.7\n%\xc7\xec\x8f\xa2",
+             "image/jpeg", "http://x/a.jpg", None),
+            ("a ZIP served as image/png", b"PK\x03\x04\x14\x00\x00\x00\x08\x00",
+             "image/png", "http://x/a.png", None),
+            ("an ELF binary served as image/png", b"\x7fELF\x02\x01\x01\x00",
+             "image/png", "http://x/a.png", None),
+            ("a gzip stream served as image/webp", b"\x1f\x8b\x08\x00\x00\x00",
+             "image/webp", None, None),
+            ("a Windows executable served as image/gif", b"MZ\x90\x00\x03\x00",
+             "image/gif", None, None),
+            ("an mp4 served as image/gif", b"\x00\x00\x00 ftypisom\x00\x00\x02\x00",
+             "image/gif", None, None),
+            # HTML the old `startswith` probe could not see, under an image
+            # header: a byte-order mark, a CDN's comment, leading blank lines.
+            ("HTML behind a UTF-8 BOM", b"\xef\xbb\xbf<!DOCTYPE html><html>",
+             "image/png", "http://x/a.png", None),
+            ("HTML behind a comment", b"<!-- cf-cache -->\n<!DOCTYPE html><html>",
+             "image/png", "http://x/a.png", None),
+            ("HTML behind blank lines", b"\n\n   <html><body>blocked",
+             "image/png", "http://x/a.png", None),
+            ("an uppercase DOCTYPE-less page", b"<HTML><BODY>blocked",
+             "image/png", None, None),
+            # ...and the same bytes with an honest header still fail, so the
+            # fix did not simply move the trust from the header to nowhere.
+            ("a JSON body served honestly", b'{"error": "not found"}',
+             "application/json", "http://x/a.png", None),
+            # --- magic bytes the sniffer did not know ------------------------
+            ("TIFF, little-endian", b"II\x2a\x00\x08\x00\x00\x00", None, None,
+             "tiff"),
+            ("TIFF, big-endian", b"MM\x00\x2a\x00\x00\x00\x08", None, None,
+             "tiff"),
+            ("ICO", b"\x00\x00\x01\x00\x01\x00\x10\x10\x00\x00", None, None,
+             "ico"),
+            ("an AVIF image sequence", b"\x00\x00\x00 ftypavis\x00\x00", None,
+             None, "avif"),
+            ("TIFF bytes under a lying image/png header",
+             b"II\x2a\x00\x08\x00\x00\x00", "image/png", "http://x/a.png",
+             "tiff"),
+            ("ICO bytes under a lying image/jpeg header",
+             b"\x00\x00\x01\x00\x01\x00", "image/jpeg", None, "ico"),
+            # --- SVG is validated at the ROOT ELEMENT ------------------------
+            ("SVG behind a comment and a doctype",
+             b"<!-- generated -->\n<!DOCTYPE svg PUBLIC '-//W3C//DTD SVG 1.1//EN'>"
+             b"\n<svg xmlns='http://www.w3.org/2000/svg'></svg>", None, None,
+             "svg"),
+            ("SVG behind a DOCTYPE internal subset",
+             b"<!DOCTYPE svg [<!ENTITY label 'safe > text'>]><svg></svg>",
+             None, None, "svg"),
+            ("SVG behind a UTF-8 BOM", b"\xef\xbb\xbf<svg xmlns='x'></svg>",
+             None, None, "svg"),
+            ("SVG behind a processing instruction",
+             b"<?xml version='1.0'?>\n<?xml-stylesheet href='a.css'?>\n<svg />",
+             None, None, "svg"),
+            # an XML document whose root is not <svg> is not an SVG, however
+            # loudly the header says otherwise
+            ("an RSS feed served as image/svg+xml",
+             b"<?xml version='1.0'?><rss><channel/></rss>", "image/svg+xml",
+             None, None),
+            ("XHTML that merely contains an <svg> later",
+             b"<?xml version='1.0'?><html><body><svg/></body></html>",
+             "image/svg+xml", "http://x/a.svg", None),
+            ("binary bytes under an image/svg+xml header", b"\x00\x01\x02\x03",
+             "image/svg+xml", None, None),
+            ("binary bytes behind a .svg URL", b"\x00\x01\x02\x03",
+             "application/octet-stream", "http://x/a.svg", None)):
+        check("sniff_extension, %s" % label,
+              sniff_extension(head, ct, url), want)
+        if want is not None:
+            exercised_extensions.add(want)
+    check("signature fixtures cover the output and conversion extension sets",
+          exercised_extensions, set(OUTPUT_EXTENSIONS | CONVERT_EXTENSIONS))
+
+    for label, svg in (
+            ("fragment references",
+             '<svg><defs><linearGradient id="g"/></defs>'
+             '<rect style="fill:url(#g)"/><use href="#g"/></svg>'),
+            ("quoted fragment CSS",
+             '<svg><style>.x{fill:url("#g")}</style><rect class="x"/></svg>'),
+            ("encoded fragment href",
+             '<svg><use href="&#35;g"/></svg>'),
+            ("inert comment text",
+             '<svg><!-- <script onload="bad()"> --><rect/></svg>'),
+            ("literal text that resembles CSS",
+             '<svg><text>@import url(https://example.test/not-css)</text></svg>'),
+            ("an inert CSS string that names a resource function",
+             '<svg><style>.x::after{content:"image(https://example.test/a)"}'
+             '</style></svg>'),
+            ("an escaped inert CSS content string",
+             '<svg><style>.x::after{content:"\\2022"}</style></svg>'),
+            ("an animation-named CSS class without animation",
+             '<svg><style>.animation:hover{fill:red}</style></svg>'),
+            ("a local shape-inside presentation reference",
+             '<svg><path id="shape"/><text shape-inside="url(#shape)"/></svg>'),
+            ("CDATA that resembles active markup",
+             '<svg><text><![CDATA[<script onload="bad()">]]></text></svg>'),
+            ("a benign processing instruction with directive-looking data",
+             '<svg><?generator value="<!DOCTYPE svg><script/>"?><rect/></svg>'),
+            ("forbidden directives inside comments",
+             '<svg><!-- <!DOCTYPE svg><?xml-stylesheet href="x"?> --></svg>')):
+        rooted = svg.replace("<svg", "<svg xmlns='%s'" % _SVG_NAMESPACE, 1)
+        check("self-contained SVG permits %s" % label,
+              _svg_safety_issue(rooted), None)
+    for label, svg, finding in (
+            ("DOCTYPE", '<!DOCTYPE svg><svg/>', "DOCTYPE"),
+            ("XML stylesheet",
+             '<?xml-stylesheet href="https://cdn.example/a.css"?><svg/>',
+             "stylesheet"),
+            ("script", '<svg><script>bad()</script></svg>', "script"),
+            ("foreignObject", '<svg><foreignObject/></svg>', "foreign"),
+            ("animation", '<svg><animate attributeName="x"/></svg>', "animation"),
+            ("animateColor", '<svg><animateColor attributeName="fill"/></svg>',
+             "animation"),
+            ("event handler", '<svg onload="bad()"/>', "event-handler"),
+            ("remote href", '<svg><image href="https://cdn.example/a.png"/></svg>',
+             "external href"),
+            ("encoded remote href",
+             '<svg><image href="&#104;ttps://cdn.example/a.png"/></svg>',
+             "external href"),
+            ("remote source attribute",
+             '<svg><image src="https://cdn.example/a.png"/></svg>',
+             "external href"),
+            ("data href", '<svg><image href="data:image/png;base64,AA"/></svg>',
+             "external href"),
+            ("external base", '<svg xml:base="https://cdn.example/"><use href="#x"/></svg>',
+             "external href"),
+            ("CSS import", '<svg><style>@import "a.css";</style></svg>',
+             "external CSS"),
+            ("CSS URL", '<svg><style>fill:url(https://cdn.example/a)</style></svg>',
+             "external CSS"),
+            ("comment-obfuscated CSS URL",
+             '<svg><style>fill:u/**/rl(https://cdn.example/a)</style></svg>',
+             "external CSS"),
+            ("escaped CSS URL",
+             '<svg><style>fill:u\\72l(https://cdn.example/a)</style></svg>',
+             "external CSS"),
+            ("CSS image string",
+             '<svg><style>.x{background:image("https://cdn.example/a")}'
+             '</style></svg>', "external CSS"),
+            ("CSS image-set protocol-relative string",
+             '<svg><style>.x{background:image-set("//cdn.example/a" 1x)}'
+             '</style></svg>', "external CSS"),
+            ("comment-obfuscated CSS image function",
+             '<svg><style>.x{background:im/**/age("a.png")}</style></svg>',
+             "external CSS"),
+            ("vendor CSS image-set relative string",
+             '<svg><style>.x{background:-webkit-image-set("a.png" 1x)}'
+             '</style></svg>', "external CSS"),
+            ("CSS src function",
+             '<svg><style>@font-face{src:src("https://cdn.example/a.woff")}'
+             '</style></svg>', "external CSS"),
+            ("escaped CSS string in a resource function",
+             '<svg><style>.x{background:image("\\68ttps://cdn.example/a")}'
+             '</style></svg>', "external CSS"),
+            ("external shape-inside presentation attribute",
+             '<svg><text shape-inside="url(https://cdn.example/shape.svg)"/>'
+             '</svg>', "external CSS"),
+            ("external mask-image presentation attribute",
+             '<svg><rect mask-image="image(https://cdn.example/mask.svg)"/>'
+             '</svg>', "external CSS"),
+            ("external fill-image presentation attribute",
+             '<svg><rect fill-image="image(https://cdn.example/fill.svg)"/>'
+             '</svg>', "external CSS"),
+            ("external offset-path presentation attribute",
+             '<svg><rect offset-path="url(https://cdn.example/path.svg)"/>'
+             '</svg>', "external CSS"),
+            ("typed CSS attr URL",
+             '<svg><text data-shape="https://cdn.example/shape.png" '
+             'shape-outside="attr(data-shape url)"/></svg>', "external CSS"),
+            ("CSS keyframes",
+             '<svg><style>@keyframes spin{to{transform:rotate(1turn)}}'
+             '</style></svg>', "CSS animation"),
+            ("vendor-prefixed CSS keyframes",
+             '<svg><style>@-moz-keyframes spin{to{transform:rotate(1turn)}}'
+             '</style></svg>', "CSS animation"),
+            ("CSS animation property",
+             '<svg><style>.x{animation:spin 1ms infinite}</style></svg>',
+             "CSS animation"),
+            ("inline CSS transition",
+             '<svg><rect style="transition:fill 1ms"/></svg>',
+             "CSS animation"),
+            ("malformed XML", '<svg><rect></svg>', "malformed XML"),
+            ("non-SVG namespace",
+             '<svg xmlns="http://www.w3.org/1999/xhtml"/>', "non-SVG"),
+            ("a root without the SVG namespace, which does not render",
+             '<svg width="1"><rect/></svg>', "without xmlns"),
+            ("active element in a foreign namespace",
+             '<svg xmlns:x="urn:example"><x:script/></svg>', "active"),
+            ("HTML responsive image in a foreign namespace",
+             '<svg xmlns:h="http://www.w3.org/1999/xhtml">'
+             '<h:img srcset="https://cdn.example/a.png 1x"/></svg>',
+             "active")):
+        check("self-contained SVG refuses %s" % label,
+              finding in (_svg_safety_issue(svg) or ""), True)
+
+    # describe_bytes is what turns a refusal into a diagnosis: "not an image"
+    # sends the reader back to the URL with nothing, "a JSON body" says the CDN
+    # answered with an error document.
+    for label, head, want in (
+            ("JSON", b'{"error": 1}', "a JSON body"),
+            ("an HTML page", b"<!DOCTYPE html><html>", "an HTML page"),
+            ("HTML behind a BOM", b"\xef\xbb\xbf<html>", "an HTML page"),
+            ("plain text", b"upstream connect error", "plain text"),
+            ("a PDF", b"%PDF-1.7\n%\xc7\xec", "a PDF"),
+            ("a ZIP", b"PK\x03\x04\x14\x00",
+             "a ZIP archive (or a zipped Office/OpenDocument file)"),
+            ("an ELF binary", b"\x7fELF\x02\x01", "an ELF executable"),
+            ("a gzip stream", b"\x1f\x8b\x08\x00", "a gzip stream"),
+            ("an SVG", b"<svg xmlns='x'/>", "an SVG document"),
+            ("a PNG", _PNG, "a PNG image"),
+            ("something unrecognized", b"\x00\x01\x02\x03",
+             "unrecognized binary data")):
+        check("describe_bytes names %s" % label, describe_bytes(head), want)
+    check("the rename inventory still sees .tiff, .tif and .ico embeds",
+          [_embedded_figure_tail("Old_2025_fig_%d.%s" % pair, "Old_2025")
+           for pair in ((1, "tiff"), (2, "tif"), (3, "ico"))],
+          ["_fig_1.tiff", "_fig_2.tif", "_fig_3.ico"])
+
+    # --- validate_slug: the only thing between free text and a vault write --
+    for bad, label in (("../evil", "a parent-directory hop"),
+                       ("..", "the parent directory itself"),
+                       ("a/../b", "a hop in the middle"),
+                       ("/etc/passwd", "an absolute path"),
+                       ("dir/slug", "a separator"),
+                       ("dir\\slug", "a backslash separator"),
+                       ("bad:name", "a URL-scheme colon"),
+                       ('bad"name', "an HTML attribute quote"),
+                       ("bad|name", "a wikilink label separator"),
+                       ("bad?name", "a Markdown query delimiter"),
+                       ("bad*name", "a Markdown emphasis marker"),
+                       ("bad<name", "a Markdown/HTML angle bracket"),
+                       ("bad\x1fname", "a control character"),
+                       ("bad\x7fname", "DEL"),
+                       ("Teslo..Cancer_2026", "`..` with no separator at all"),
+                       ("", "an empty slug"),
+                       ("   ", "a whitespace-only slug"),
+                       (None, "no slug at all"),
+                       (".", "a slug that names no note"),
+                       (".hidden", "a leading dot"),
+                       (" leading", "a leading space"),
+                       ("nul\x00byte", "an embedded NUL")):
+        raises("validate_slug refuses %s (%r)" % (label, bad),
+               validate_slug, bad)
+    for ordinary_slug in ("CON", "COM1", "aux.extra", "trailing.", "trailing "):
+        check("validate_slug accepts macOS/Linux stem %r" % ordinary_slug,
+              validate_slug(ordinary_slug), ordinary_slug)
+    check("validate_slug passes an ordinary slug",
+          validate_slug("Teslo_Pancreatic_Cancer_2026"),
+          "Teslo_Pancreatic_Cancer_2026")
+    check("...and a slug with a dot in it, which is not a hop",
+          validate_slug("Geron_ML_1.5_2024"), "Geron_ML_1.5_2024")
+    check("...and reports which argument was wrong",
+          "--old-slug" in raises("validate_slug names its argument",
+                                 validate_slug, "../x", "--old-slug"), True)
+    for bad in (0, -1, 1.5, "1", True, None):
+        raises("validate_index refuses a non-positive or non-integer index %r" % (bad,),
+               validate_index, bad)
+    check("validate_index accepts the first and later figure numbers",
+          [validate_index(1), validate_index(20)], [1, 20])
+    rendered_fixture = """![[Visible_fig_1.png]]
+`![[Inline_code_fig_2.png]]`
+`multiline code
+![[Multiline_code_fig_2b.png]]
+continues here`
+```md
+![[Fence_fig_3.png]]
+```
+    ![[Indented_fig_4.png]]
+<!-- ![[Html_comment_fig_5.png]] -->
+%% ![[Obsidian_comment_fig_6.png]] %%
+<code>![[Html_code_fig_6b.png]]</code>
+<script>![[Script_fig_6c.png]]</script>
+\\![[Escaped_fig_7.png]]
+![[folder/Qualified_fig_8.png]]
+![[Aliased_fig_9.png|640]]
+"""
+    check("only rendered filename-only embeds establish clipping ownership",
+          _rendered_embed_basenames(rendered_fixture),
+          frozenset(("Visible_fig_1.png", "Aliased_fig_9.png")))
+    check("a table cell's escaped-pipe size still establishes ownership",
+          _rendered_embed_basenames(
+              "| a | b |\n|---|---|\n| ![[Table_fig_1.png\\|300]] | x |\n"),
+          frozenset(("Table_fig_1.png",)))
+    check("malformed literal delimiters do not create ownership evidence",
+          _rendered_embed_basenames(
+              "%% ![[Comment_fig_2.png]]\n"
+              "<code>![[Html_fig_3.png]]\n"),
+          frozenset())
+    check("an unmatched backtick is literal text, so its embed renders",
+          _rendered_embed_basenames("unclosed ` ![[Inline_fig_1.png]]\n"),
+          frozenset(("Inline_fig_1.png",)))
+    check("indented list continuations still establish ownership",
+          _rendered_embed_basenames(
+              "1. Open.\n\n    ![[List_fig_1.png]]\n2. Save.\n\t![[List_fig_2.png]]\n"
+              "\nPara\n\n    ![[Code_fig_3.png]]\n"),
+          frozenset(("List_fig_1.png", "List_fig_2.png")))
+    check("an escaped backtick does not hide later embeds",
+          _rendered_embed_basenames("Press the \\` key.\n\n![[After_fig_1.png]]\n"),
+          frozenset(("After_fig_1.png",)))
+    for prefix in ("Press the ` key.", "``quoted''", "Wrap code in ``` fences."):
+        check("a lone backtick run (%r) does not hide later embeds" % prefix,
+              _rendered_embed_basenames(prefix + "\n\n![[After_fig_1.png]]\n"),
+              frozenset(("After_fig_1.png",)))
+    check("backticks in separate paragraphs never pair across an embed",
+          _rendered_embed_basenames(
+              "Press ` now.\n\n![[Mid_fig_0.png]]\n\nThen ` again."
+              "\n\n![[After_fig_1.png]]\n"),
+          frozenset(("Mid_fig_0.png", "After_fig_1.png")))
+    check("a fence inside a blockquote or callout is still code",
+          [_rendered_embed_basenames(prefix + "```md\n" + prefix
+                                     + "![[Quoted_fig_1.png]]\n" + prefix + "```\n")
+           for prefix in ("> ", "> > ")]
+          + [_rendered_embed_basenames("> [!example]\n> ~~~\n> ![[Quoted_fig_1.png]]\n> ~~~\n"),
+             _rendered_embed_basenames("> [!note]\n> ![[Callout_fig_1.png]]\n")],
+          [frozenset(), frozenset(), frozenset(), frozenset(("Callout_fig_1.png",))])
+    check("a quoted fence line inside an unquoted fence does not close it",
+          _rendered_embed_basenames("```md\n> ```\n![[Fence_fig_1.png]]\n```\n"),
+          frozenset())
+    check("a leading code span is not indentation, quoted or not",
+          [_rendered_embed_basenames(prefix + "`x` ![[Lead_fig_1.png]]\n")
+           for prefix in ("", "> ")],
+          [frozenset(("Lead_fig_1.png",))] * 2)
+    check("a fence in a quoted list continuation is code at any indentation",
+          [_rendered_embed_basenames(body) for body in (
+              "> - item\n>\n>     ```md\n>     ![[F_fig_1.png]]\n>     ```\n> ![[After_fig_2.png]]\n",
+              "> - item\n>\t```md\n>\t![[F_fig_1.png]]\n>\t```\n> ![[After_fig_2.png]]\n")],
+          [frozenset(("After_fig_2.png",))] * 2)
+    check("a fence opened on a list item's marker line is code",
+          [_rendered_embed_basenames(body) for body in (
+              "1. ```md\n   ![[F_fig_1.png]]\n   ```\n",
+              "- ~~~\n  ![[F_fig_1.png]]\n  ~~~\n",
+              "> - ```md\n>   ![[F_fig_1.png]]\n>   ```\n")],
+          [frozenset()] * 3)
+    check("a deeper-quoted fence line inside a quoted fence does not close it",
+          _rendered_embed_basenames(
+              "> ```md\n> > ```\n> ![[Deep_fig_1.png]]\n> ```\n> ![[After_fig_2.png]]\n"),
+          frozenset(("After_fig_2.png",)))
+    check("indented code inside a blockquote is code; a quoted list continuation renders",
+          [_rendered_embed_basenames(lead + "\n>\n>     ![[Quote_fig_1.png]]\n")
+           for lead in ("> Para", "> `a` text", "> - item")],
+          [frozenset(), frozenset(), frozenset(("Quote_fig_1.png",))])
+    dependency_fixture = """[[Old_Slug_2025|old note]]
+![[Sources/Images/Old_Slug_2025_fig_1.png#crop|figure]]
+[note](../Articles/Old_Slug_2025.md)
+<img src="Sources/Images/Old_Slug_2025_fig_2.png">
+`![[Old_Slug_2025_fig_3.png]]`
+<!-- [[Old_Slug_2025]] -->
+[remote](https://example.com/Old_Slug_2025_fig_4.png)
+"""
+    check("dependency parsing sees local old-note/image targets but not inert or remote text",
+          _markdown_dependency_names(
+              dependency_fixture,
+              ["Old_Slug_2025_fig_%d.png" % n for n in range(1, 5)],
+              "Old_Slug_2025"),
+          ["Old_Slug_2025.md", "Old_Slug_2025_fig_1.png",
+           "Old_Slug_2025_fig_2.png"])
+    check("dependency parsing sees bracketed link text, a linked image's "
+          "outer target and an unquoted HTML src",
+          _markdown_dependency_names(
+              "[a [b]](../Articles/Old_Slug_2025.md)\n"
+              "[![f](x.png)](Sources/Images/Old_Slug_2025_fig_1.png)\n"
+              "<img src=Sources/Images/Old_Slug_2025_fig_2.png>\n",
+              ["Old_Slug_2025_fig_1.png", "Old_Slug_2025_fig_2.png"],
+              "Old_Slug_2025"),
+          ["Old_Slug_2025.md", "Old_Slug_2025_fig_1.png",
+           "Old_Slug_2025_fig_2.png"])
+    check("dependency parsing sees links in nested lists and after a stray backtick",
+          _markdown_dependency_names(
+              "    - [[Old_Slug_2025]]\nstray ` prose\n"
+              "        - ![[Old_Slug_2025_fig_1.png]]\n",
+              ["Old_Slug_2025_fig_1.png"], "Old_Slug_2025"),
+          ["Old_Slug_2025.md", "Old_Slug_2025_fig_1.png"])
+    check("malformed comments and code cannot hide retirement dependencies",
+          _markdown_dependency_names(
+              "` [[Old_Slug_2025]] ``\n"
+              "%% unclosed ![[Old_Slug_2025_fig_1.png]]\n"
+              "<code>unclosed [[Old_Slug_2025]]\n",
+              ["Old_Slug_2025_fig_1.png"], "Old_Slug_2025"),
+          ["Old_Slug_2025.md", "Old_Slug_2025_fig_1.png"])
+    literal_dependency = (
+        'The HTML opener is `<!--`.\n\n![[Old_Slug_2025_fig_1.png]]\n\n'
+        'The closer is `-->`.\n')
+    check("comment syntax in separate inline examples cannot hide a real dependency",
+          _markdown_dependency_names(literal_dependency,
+              ["Old_Slug_2025_fig_1.png"], "Old_Slug_2025"),
+          ["Old_Slug_2025_fig_1.png"])
+    check("literal comment syntax cannot hide a genuine ownership embed",
+          _rendered_embed_basenames(literal_dependency),
+          frozenset(("Old_Slug_2025_fig_1.png",)))
+    check("YAML comment-like strings cannot hide body dependencies",
+          _markdown_dependency_names(
+              '---\ndescription: "<!--"\n---\n![[Old_Slug_2025_fig_1.png]]\n',
+              ["Old_Slug_2025_fig_1.png"], "Old_Slug_2025"),
+          ["Old_Slug_2025_fig_1.png"])
+
+    import shutil
+    tmp = tempfile.mkdtemp(prefix="fetch_images_selftest.")
+    previous_tempdir = tempfile.tempdir
+    try:
+        # The leak check must observe this run's scratch files, not another
+        # self-test or real download using the same system temporary folder.
+        tempfile.tempdir = tmp
+        att = os.path.join(tmp, "Sources", "Images")
+        os.makedirs(att)
+        pdfs = os.path.join(tmp, "Sources", "PDFs")
+        os.mkdir(pdfs)
+        occupied_pdf = os.path.join(pdfs, "Taken_Slug_2026.pdf")
+        with open(occupied_pdf, "wb") as fh:
+            fh.write(b"%PDF-1.4\n")
+        with open(os.path.join(att, "Taken_Slug_2026_fig_1.png"), "wb") as fh:
+            fh.write(_PNG)
+        check("slug preflight reports both PDF and image-prefix owners",
+              slug_occupancy(tmp, "Taken_Slug_2026"),
+              {"ok": False, "vault": os.path.abspath(tmp),
+               "slug": "Taken_Slug_2026", "pdf_stem_occupied": True,
+               "image_occupants": ["Taken_Slug_2026_fig_1.png"]})
+        check("slug preflight reports a genuinely free stem",
+              slug_occupancy(tmp, "Free_Slug_2026")["ok"], True)
+        os.unlink(os.path.join(att, "Taken_Slug_2026_fig_1.png"))
+        os.unlink(occupied_pdf)
+        os.rmdir(pdfs)
+        sources = os.path.join(tmp, "Sources", "PDFs")
+        os.makedirs(sources)
+        articles = os.path.join(tmp, "Articles")
+        os.makedirs(articles)
+        dst = os.path.join(tmp, "body")
+
+        def clipping_note(slug, embeds=(), source="https://example.com/article",
+                          body_prefix=""):
+            """Write one canonical clipping owner for a guarded self-test."""
+            expected = _manifest_name_key(slug + ".md")
+            for name in os.listdir(articles):
+                if _manifest_name_key(name) == expected:
+                    os.unlink(os.path.join(articles, name))
+            path = os.path.join(articles, slug + ".md")
+            with open(path, "w", encoding="utf-8") as fh:
+                fh.write("---\nsources:\n  - %s\n---\n%s" %
+                         (source, body_prefix))
+                for name in embeds:
+                    fh.write("\n![[%s]]\n" % name)
+            return path
+
+        def checked_plan(*args, **kwargs):
+            """Every ordinary self-test call follows the required ownership path."""
+            kwargs.setdefault("sources", sources)
+            if "owner_note" not in kwargs and len(args) >= 3:
+                matched = [os.path.basename(path)
+                           for path in _glob_slug(args[0], args[1], _FIG_GLOB)]
+                kwargs["owner_note"] = clipping_note(args[1], matched)
+            return _plan_slug_rename(*args, **kwargs)
+
+        def touch(path, data=b"x"):
+            with open(path, "wb") as fh:
+                fh.write(data)
+            return path
+
+        # Path and handle metadata must agree throughout each read.
+        real_fstat = os.fstat
+
+        class _AlteredStat:
+            def __init__(self, item, ctime_delta=0, ino_delta=0):
+                self.item = item
+                self.ctime_delta = ctime_delta
+                self.ino_delta = ino_delta
+
+            def __getattr__(self, name):
+                if name == "st_ctime_ns":
+                    return getattr(self.item, name) + self.ctime_delta
+                if name == "st_ino":
+                    return self.item.st_ino + self.ino_delta
+                return getattr(self.item, name)
+
+        snapshot_path = touch(os.path.join(tmp, "stable-snapshot.bin"), b"stable")
+        markdown_path = touch(
+            os.path.join(tmp, "stable-note.md"),
+            b"---\nsources:\n  - https://example.com/article\n---\nbody\n")
+        stable_snapshot = _stable_regular_snapshot(snapshot_path)
+        stable_markdown = _stable_markdown_text(markdown_path)
+        check("stable readers bind the same bytes and metadata",
+              (stable_snapshot[1], stable_markdown.endswith("body\n")),
+              (__import__("hashlib").sha256(b"stable").hexdigest(), True))
+
+        occupied_copy = touch(os.path.join(tmp, "occupied-copy.bin"), b"another writer")
+        try:
+            _stable_regular_snapshot(snapshot_path, copy_to=occupied_copy)
+            copy_refused = False
+        except FileExistsError:
+            copy_refused = True
+        check("failed exclusive scratch copying preserves a preexisting destination",
+              (copy_refused, open(occupied_copy, "rb").read()
+               if os.path.isfile(occupied_copy) else None), (True, b"another writer"))
+
+        replaced_copy = os.path.join(tmp, "replaced-copy.bin")
+
+        def replace_copy_before_failure(handle, mode):
+            os.unlink(replaced_copy)
+            touch(replaced_copy, b"newer scratch writer")
+            raise OSError("simulated copy failure after another writer won")
+
+        try:
+            with patch.dict(globals(), set_private_mode=replace_copy_before_failure):
+                _stable_regular_snapshot(snapshot_path, copy_to=replaced_copy)
+            replaced_refused = False
+        except OSError:
+            replaced_refused = True
+        check("copy failure cannot delete a newer scratch occupant",
+              (replaced_refused, open(replaced_copy, "rb").read()
+               if os.path.isfile(replaced_copy) else None),
+              (True, b"newer scratch writer"))
+
+        fifo_path = touch(os.path.join(tmp, "snapshot-fifo-race.bin"), b"regular before swap")
+        real_open = os.open
+
+        def swap_snapshot_to_fifo(path, flags, *args, **kwargs):
+            if os.fspath(path) == fifo_path:
+                if not flags & os.O_NONBLOCK:
+                    raise AssertionError("would block waiting for a FIFO writer")
+                os.unlink(fifo_path)
+                os.mkfifo(fifo_path)
+            return real_open(path, flags, *args, **kwargs)
+
+        try:
+            with patch.object(os, "open", side_effect=swap_snapshot_to_fifo):
+                _stable_regular_snapshot(fifo_path)
+            fifo_refused = False
+        except OSError:
+            fifo_refused = True
+        except AssertionError:
+            fifo_refused = False
+        check("a regular image snapshot swapped to a FIFO is refused without waiting",
+              fifo_refused, True)
+        os.unlink(fifo_path)
+        touch(fifo_path, b"regular Markdown before swap")
+        try:
+            with patch.object(os, "open", side_effect=swap_snapshot_to_fifo):
+                _stable_markdown_text(fifo_path)
+            markdown_fifo_refused = False
+        except ValueError:
+            markdown_fifo_refused = True
+        except AssertionError:
+            markdown_fifo_refused = False
+        check("a Markdown dependency swapped to a FIFO is refused without waiting",
+              markdown_fifo_refused, True)
+        os.unlink(fifo_path)
+
+        calls = {"count": 0}
+
+        def changing_fstat(descriptor):
+            calls["count"] += 1
+            return _AlteredStat(real_fstat(descriptor),
+                               ctime_delta=calls["count"] * 100)
+
+        try:
+            with patch.object(os, "fstat", side_effect=changing_fstat):
+                _stable_regular_snapshot(snapshot_path)
+            snapshot_changed = False
+        except OSError:
+            snapshot_changed = True
+        check("regular snapshots reject a handle view that changes during the read",
+              snapshot_changed, True)
+
+        calls["count"] = 0
+        try:
+            with patch.object(os, "fstat", side_effect=changing_fstat):
+                _stable_markdown_text(markdown_path)
+            markdown_changed = False
+        except ValueError:
+            markdown_changed = True
+        check("Markdown snapshots reject a handle view that changes during the read",
+              markdown_changed, True)
+
+        def mismatched_fstat(descriptor):
+            return _AlteredStat(real_fstat(descriptor), ino_delta=1)
+
+        try:
+            with patch.object(os, "fstat", side_effect=mismatched_fstat):
+                _stable_markdown_text(markdown_path)
+            markdown_mismatched = False
+        except ValueError:
+            markdown_mismatched = True
+        check("Markdown snapshots bind path and handle views by file identity",
+              markdown_mismatched, True)
+
+        urls_file = touch(os.path.join(tmp, "urls.txt"),
+                          b"\xef\xbb\xbfhttps://example.com/a.png\n\n"
+                          b"https://example.com/b.png\n")
+        check("--urls-file is decoded as UTF-8-sig",
+              _read_urls_file(urls_file),
+              ["https://example.com/a.png", "https://example.com/b.png"])
+        os.unlink(urls_file)
+        check("--urls-file is closed after the complete read",
+              os.path.lexists(urls_file), False)
+        bad_urls = touch(os.path.join(tmp, "bad-urls.txt"), b"https://x/\xff.png\n")
+        raises("--urls-file refuses invalid UTF-8 instead of dropping bytes",
+               _read_urls_file, bad_urls)
+
+        check("report URLs omit HTTP credentials, queries, and fragments",
+              _report_url(
+                  "https://alice:secret@example.com:8443/image.png?token=abc#crop"),
+              "https://example.com:8443/image.png?<query omitted>")
+        check("report URLs omit inline data payloads",
+              _report_url("data:image/png;base64,SECRET-BYTES"),
+              "data:image/png;base64,<payload omitted>")
+        check("an unparseable report URL reveals no location text",
+              _report_url("not a URL with secret material"),
+              "URL:<location omitted>")
+        malformed_secret = (
+            "https://alice:password@example.com\N{FULLWIDTH SOLIDUS}private"
+            "?token=secret")
+        malformed_error = raises(
+            "a malformed URL is refused without echoing its raw text",
+            _vetted_target, malformed_secret)
+        check("the malformed-URL error omits credentials, path, and query",
+              all(secret not in malformed_error
+                  for secret in ("alice", "password", "private", "secret")),
+              True)
+
+        def current_owner(folder, slug, extra=()):
+            embeds = [os.path.basename(path)
+                      for path in _glob_slug(folder, slug, _FIG_GLOB)]
+            embeds.extend(extra)
+            return clipping_note(slug, embeds)
+
+        # --- _ensure_within -------------------------------------------------
+        check("_ensure_within accepts a path inside",
+              _ensure_within(att, os.path.join(att, "a_fig_1.png")),
+              os.path.realpath(os.path.join(att, "a_fig_1.png")))
+        raises("_ensure_within refuses a `..` escape",
+               _ensure_within, att, os.path.join(att, "..", "a.png"))
+        raises("_ensure_within refuses the folder itself", _ensure_within,
+               att, att)
+        # a SIBLING whose name merely starts with the folder's name: a prefix
+        # test without the separator accepts `Sources/Imagesevil/`
+        sibling = os.path.join(tmp, "Sources", "Imagesevil")
+        os.makedirs(sibling)
+        raises("_ensure_within refuses a sibling with a shared prefix",
+               _ensure_within, att, os.path.join(sibling, "a.png"))
+        outside = touch(os.path.join(tmp, "outside.png"))
+        link = os.path.join(att, "link_fig_1.png")
+        os.symlink(outside, link)
+        raises("_ensure_within resolves a symlink out of the folder",
+               _ensure_within, att, link)
+        os.remove(link)
+
+        # --- the scheme and private-host guards, called directly ------------
+        for url, label in (("file:///etc/passwd", "file:"),
+                           ("FILE:///etc/passwd", "file: in capitals"),
+                           ("javascript:alert(1)", "javascript:"),
+                           ("ftp://example.com/a.png", "ftp:"),
+                           ("/relative/a.png", "a scheme-less path")):
+            raises("check_url refuses %s" % label, check_url, url)
+        # A host-less URL is refused here, by name, rather than falling into the
+        # resolver as an opaque `getaddrinfo` failure.
+        check("check_url refuses an http URL with no host, and says so",
+              "no host" in raises("check_url refuses a host-less URL",
+                                  check_url, "http:///a.png"), True)
+        check("check_url allows a data: URI",
+              check_url("data:image/png;base64,AAAA"), None)
+        with patch.object(socket, "getaddrinfo") as port_dns:
+            raises("check_url refuses an empty port before resolving",
+                   check_url, "https://example.com:/a.png")
+            raises("check_url refuses port zero before resolving",
+                   check_url, "https://example.com:0/a.png")
+            raises("check_url refuses an empty bracketed-IPv6 port before resolving",
+                   check_url, "https://[2001:4860:4860::8888]:/a.png")
+        check("invalid empty and zero ports do not consult the host resolver",
+              port_dns.call_count, 0)
+        # Loopback, link-local and private space, in the spellings that are
+        # meant to slip past a string test. These resolve locally (a numeric
+        # literal or /etc/hosts), so no DNS query leaves the machine.
+        for host, label in (("127.0.0.1", "dotted-quad loopback"),
+                            ("2130706433", "loopback as a decimal integer"),
+                            ("0177.0.0.1", "loopback in octal"),
+                            ("[::1]", "IPv6 loopback"),
+                            ("localhost", "localhost by name"),
+                            ("169.254.169.254", "the link-local metadata address"),
+                            ("10.0.0.5", "RFC1918 private space"),
+                            ("192.168.1.1", "a home router"),
+                            ("100.64.0.1", "shared carrier/private-overlay space"),
+                            ("0.0.0.0", "the unspecified address")):
+            url = "http://%s/a.png" % host
+            try:
+                socket.getaddrinfo(host.strip("[]"), 80,
+                                   type=socket.SOCK_STREAM)
+            except socket.gaierror:
+                # Some platforms reject a legacy numeric spelling before this
+                # script can classify it. The mocked cases below cover those.
+                continue
+            raises("check_url refuses %s (%s)" % (label, host), check_url, url)
+            check("...unless --allow-private-hosts is passed (%s)" % host,
+                  check_url(url, True), None)
+        # Resolve one target once, reject every returned address, then connect
+        # only to a vetted sockaddr. The second DNS answer below is the private
+        # rebinding answer an ordinary URL client would consume.
+        _public = [(socket.AF_INET, socket.SOCK_STREAM, 6, "", ("177.0.0.1", 0))]
+        with patch.object(socket, "getaddrinfo", return_value=_public) as _dns:
+            for _host in ("0177.0.0.1", "0x7f000001", "2130706433", "127.1"):
+                raises("ambiguous numeric host is refused before a public DNS answer: "
+                       + _host, check_url, "http://" + _host + "/a.png")
+            check("numeric alias refusal does not consult the host resolver",
+                  _dns.call_count, 0)
+
+        _public4 = [(socket.AF_INET, socket.SOCK_STREAM, 6, "",
+                     ("198.51.100.20", 80))]
+        _private4 = [(socket.AF_INET, socket.SOCK_STREAM, 6, "",
+                      ("127.0.0.1", 80))]
+        # TEST-NET addresses are not is_global in modern Python, so use a
+        # genuinely global fixture for classifications below.
+        _public4[0] = (_public4[0][0], _public4[0][1], _public4[0][2], "",
+                       ("177.0.0.1", 80))
+
+        class _SocketProbe:
+            def __init__(self):
+                self.connected = None
+                self.timeouts = []
+                self.closed = False
+
+            def settimeout(self, value):
+                self.timeouts.append(value)
+
+            def connect(self, sockaddr):
+                self.connected = sockaddr
+
+            def close(self):
+                self.closed = True
+
+        with patch.object(socket, "getaddrinfo",
+                          side_effect=[_public4, _private4]) as _dns:
+            target = _vetted_target("http://media.example/a.png")
+            probe = _SocketProbe()
+            with patch.object(socket, "socket", return_value=probe):
+                connected = _connect_vetted(
+                    target, 5, time.monotonic() + 5)
+            check("a rebinding answer is never requested after target vetting",
+                  _dns.call_count, 1)
+            check("the actual socket is pinned to the vetted IPv4 sockaddr",
+                  (connected is probe, probe.connected),
+                  (True, ("177.0.0.1", 80)))
+
+        _public6 = [(socket.AF_INET6, socket.SOCK_STREAM, 6, "",
+                     ("2606:4700:4700::1111", 8443, 0, 0))]
+        with patch.object(socket, "getaddrinfo", return_value=_public6):
+            ipv6 = _vetted_target(
+                "https://[2606:4700:4700::1111]:8443/a.png")
+        check("IPv6 stays bracketed in the logical Host header",
+              ipv6.host_header, "[2606:4700:4700::1111]:8443")
+        check("the IPv6 sockaddr is retained verbatim for the pinned socket",
+              ipv6.addresses[0][4], ("2606:4700:4700::1111", 8443, 0, 0))
+
+        with patch.object(socket, "getaddrinfo",
+                          return_value=_public4 + _private4):
+            raises("one private answer rejects a mixed public/private DNS set",
+                   _vetted_target, "http://mixed.example/a.png")
+        with patch.object(socket, "getaddrinfo", return_value=_private4):
+            check("--allow-private-hosts remains the explicit private escape hatch",
+                  _vetted_target("http://private.example/a.png", True).addresses,
+                  tuple(_private4))
+
+        # Python 3.9 classifies several IPv6 transition spellings as globally
+        # routable without classifying the IPv4 endpoint they carry. A NAT64,
+        # 6to4, compatible, or ISATAP address can otherwise tunnel this fetch
+        # to loopback/RFC1918 space while passing the nominal IPv6 check.
+        tunneled_private = (
+            ("IPv4-mapped", "::ffff:127.0.0.1"),
+            ("IPv4-compatible", "::127.0.0.1"),
+            ("well-known NAT64", "64:ff9b::7f00:1"),
+            ("local-use NAT64", "64:ff9b:1:a00:0:100::"),
+            ("6to4", "2002:7f00:1::"),
+            ("Teredo", "2001:0:808:808:0:ffff:80ff:fffe"),
+            ("ISATAP", "2606:4700::5efe:7f00:1"),
+        )
+        for label, literal in tunneled_private:
+            hidden = _embedded_ipv4_addresses(ipaddress.ip_address(literal))
+            check("%s exposes its embedded IPv4 endpoint" % label,
+                  bool(hidden), True)
+            check("%s with a private embedded endpoint is non-public" % label,
+                  _public_ip(ipaddress.ip_address(literal)), False)
+            tunneled = [(socket.AF_INET6, socket.SOCK_STREAM, 6, "",
+                         (literal, 80, 0, 0))]
+            with patch.object(socket, "getaddrinfo", return_value=tunneled):
+                raises("the URL guard refuses private IPv4 through %s" % label,
+                       _vetted_target, "http://transition.example/a.png")
+        check("deprecated IPv6 site-local space is never treated as public",
+              _public_ip(ipaddress.ip_address("fec0::1")), False)
+
+        # Public embedded endpoints are not rejected merely because the outer
+        # form has one. Python 3.9 independently marks compatible/NAT64 space
+        # reserved, so those remain outside this script's open-web policy.
+        for label, literal in (
+                ("6to4", "2002:808:808::"),
+                ("ISATAP", "2606:4700::5efe:808:808")):
+            check("%s with a public IPv4 endpoint remains public" % label,
+                  _public_ip(ipaddress.ip_address(literal)), True)
+        public_6to4 = ipaddress.ip_address("2002:808:808::")
+        with patch.object(ipaddress.IPv6Address, "is_global",
+                          new_callable=PropertyMock, return_value=False), \
+                patch.object(ipaddress.IPv6Address, "is_private",
+                             new_callable=PropertyMock, return_value=True):
+            check("6to4 policy is stable when Python classifies its outer prefix private",
+                  _public_ip(public_6to4), True)
+
+        request_probe = {}
+
+        class _WireProbe(_SocketProbe):
+            def __init__(self):
+                super().__init__()
+                self.sent = bytearray()
+
+            def sendall(self, data):
+                self.sent.extend(data)
+
+            def makefile(self, _mode, *args, **kwargs):
+                return io.BytesIO(
+                    b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n")
+
+        wire = _WireProbe()
+        default_tls = ssl.create_default_context()
+        check("the real default TLS context validates chains and hostnames",
+              (default_tls.check_hostname, default_tls.verify_mode),
+              (True, ssl.CERT_REQUIRED))
+
+        class _TLSProbe:
+            check_hostname = True
+            verify_mode = ssl.CERT_REQUIRED
+
+            def wrap_socket(self, sock, server_hostname=None):
+                request_probe["sni"] = server_hostname
+                request_probe["tls_input"] = sock
+                return sock
+
+        with patch.object(socket, "getaddrinfo", return_value=_public4):
+            https_target = _vetted_target(
+                "https://Media.Example:8443/a%2Fb?q=a%20b+plus#omit-me")
+            explicit_default = _vetted_target(
+                "https://Media.Example:443/empty-query?#omit-me")
+        check("Host preserves an explicitly written default port",
+              explicit_default.host_header, "media.example:443")
+        check("an empty query delimiter is preserved while its fragment is omitted",
+              explicit_default.request_target, "/empty-query?")
+        tls_probe = _TLSProbe()
+        with patch.dict(globals(), {"_connect_vetted": lambda *_a, **_kw: wire}), \
+                patch.object(ssl, "create_default_context", return_value=tls_probe):
+            https_conn, https_resp = _request_once(
+                https_target, 5, time.monotonic() + 5)
+        sent_request = wire.sent.decode("iso-8859-1")
+        check("HTTPS keeps the logical host for SNI and Host, never the pinned IP",
+              (request_probe["sni"], "Host: media.example:8443\r\n" in sent_request,
+               "177.0.0.1" in sent_request),
+              ("media.example", True, False))
+        check("the request target preserves percent/query spelling and omits fragments",
+              sent_request.split("\r\n", 1)[0],
+              "GET /a%2Fb?q=a%20b+plus HTTP/1.1")
+        check("the TLS wrapper receives the already-pinned socket",
+              request_probe["tls_input"] is wire, True)
+        check("the TLS context contract keeps certificate hostname validation on",
+              (tls_probe.check_hostname, tls_probe.verify_mode),
+              (True, ssl.CERT_REQUIRED))
+        https_resp.close()
+        https_conn.close()
+
+        # Redirects are followed manually. Each next URL is resolved/guarded
+        # before another request and before its redirect body can be consumed.
+        redir = _FakeResponse(
+            [b"untrusted redirect body"], {"Location": "http://private.example/x"},
+            status=302, reason="Found")
+        redir_conn = _FakeConnection()
+        with patch.object(socket, "getaddrinfo",
+                          side_effect=[_public4, _private4]) as _dns, \
+                patch.dict(globals(), {"_request_once": lambda *_a, **_kw:
+                           (redir_conn, redir)}):
+            raises("a redirect to a private address is refused before requesting it",
+                   _fetch_to_path, "http://media.example/a.png", dst, 5,
+                   1000, 30, False)
+        check("the redirect target is a separately guarded single resolution",
+              _dns.call_count, 2)
+        check("a rejected redirect body is never read",
+              (redir.read_count, redir.closed, redir_conn.closed),
+              (0, True, True))
+
+        downgrade = _FakeResponse(
+            [b"downgrade body"], {"Location": "http://media2.example/x"},
+            status=302, reason="Found")
+        with patch.object(socket, "getaddrinfo",
+                          side_effect=[_public4, _public4]), \
+                patch.dict(globals(), {"_request_once": lambda *_a, **_kw:
+                           (_FakeConnection(), downgrade)}):
+            raises("an HTTPS redirect cannot downgrade to HTTP",
+                   _fetch_to_path, "https://media.example/a.png", dst, 5,
+                   1000, 30, False)
+        check("the refused downgrade body is never read", downgrade.read_count, 0)
+
+        first = _FakeResponse([], {"Location": "/final?q=1%202"},
+                              status=302, reason="Found")
+        final = _FakeResponse([_PNG], {"Content-Type": "image/png",
+                                      "Content-Length": str(len(_PNG))})
+        calls = []
+
+        def fake_request(target, *_a, **_kw):
+            calls.append(target)
+            return (_FakeConnection(), first if len(calls) == 1 else final)
+
+        record = {}
+        with patch.object(socket, "getaddrinfo",
+                          side_effect=[_public4, _public4]) as _dns, \
+                patch.dict(globals(), {"_request_once": fake_request}):
+            content_type, fetched = _fetch_to_path(
+                "http://media.example/start", dst, 5, 1000, 30, False, record)
+        check("a safe redirect resolves exactly once per requested hop",
+              (_dns.call_count, len(calls)), (2, 2))
+        check("a safe redirect reaches the final body and reports its URL",
+              (content_type, fetched, record["final_url"],
+               open(dst, "rb").read()),
+              ("image/png", len(_PNG),
+               "http://media.example/final?q=1%202", _PNG))
+
+        for status in (300, 304, 305, 306, 399):
+            unexpected = _FakeResponse(
+                [_PNG], {"Content-Type": "image/png"}, status=status,
+                reason="Not a followed redirect")
+            with patch.object(socket, "getaddrinfo", return_value=_public4), \
+                    patch.dict(globals(), {"_request_once": lambda *_a, _r=unexpected,
+                               **_kw: (_FakeConnection(), _r)}):
+                raises("HTTP %d cannot be accepted as a successful payload" % status,
+                       _fetch_to_path, "http://media.example/a.png", dst, 5,
+                       1000, 30, False)
+            check("HTTP %d body is not read" % status, unexpected.read_count, 0)
+
+        # A hostile origin can put arbitrary text in the HTTP reason phrase,
+        # including a reflected signed query. It is not useful diagnostics and
+        # must not bypass URL redaction through HTTPError.__str__.
+        denied = _FakeResponse(
+            [], {}, status=403,
+            reason="reflected token=do-not-report#private")
+        secret_url = "http://media.example/a.png?token=do-not-report#private"
+        with patch.object(socket, "getaddrinfo", return_value=_public4), \
+                patch.dict(globals(), {"_request_once": lambda *_a, **_kw:
+                           (_FakeConnection(), denied)}):
+            denied_result = download_one(
+                secret_url, att, "Redacted_Error_2026", 1)
+        check("an HTTP failure report redacts its query and fragment everywhere",
+              (denied_result["url"],
+               "do-not-report" in json.dumps(denied_result),
+               "private" in json.dumps(denied_result)),
+              ("http://media.example/a.png?<query omitted>", False, False))
+
+        raises("a redirect to file: is refused at the hop",
+               _vetted_target, "file:///etc/passwd")
+
+        for field, values in (("timeout", (0, -1, True, None)),
+                              ("max_bytes", (0, -1, True, 1.5, None)),
+                              ("max_seconds", (0, -1, True, None))):
+            for bad in values:
+                limits = {"timeout": 5, "max_bytes": 1000, "max_seconds": 30}
+                limits[field] = bad
+                raises("programmatic %s refuses %r" % (field, bad),
+                       _validate_transfer_limits, limits["timeout"],
+                       limits["max_bytes"], limits["max_seconds"])
+        for bad in ("0", "-1", "1.5", "nope"):
+            raises("CLI transfer limits refuse %r" % bad,
+                   _positive_int_arg, bad)
+
+        # --- _stream_to_file, driven by a fake response ---------------------
+        far = time.monotonic() + 60
+        check("_stream_to_file returns the byte count",
+              _stream_to_file(_FakeResponse([b"abc", b"de"]), dst, 1000, far), 5)
+        check("...and writes exactly those bytes", open(dst, "rb").read(),
+              b"abcde")
+        check("a declared Content-Length that matches is fine",
+              _stream_to_file(_FakeResponse([b"abcde"]), dst, 1000, far, 5), 5)
+        # A server that announced 100 bytes, sent 58 and closed used to produce
+        # `ok` and a corrupt image, and the re-run was then refused as present.
+        raises("a short read against Content-Length is a failed download",
+               _stream_to_file, _FakeResponse([b"abc"]), dst, 1000, far, 100)
+        raises("the byte cap is enforced across chunks", _stream_to_file,
+               _FakeResponse([b"x" * 40, b"x" * 40]), dst, 50, far)
+        raises("...and on a single oversized chunk", _stream_to_file,
+               _FakeResponse([b"x" * 4096]), dst, 50, far)
+        check("a response exactly at the cap is not over it",
+              _stream_to_file(_FakeResponse([b"x" * 50]), dst, 50, far), 50)
+        # The wall-clock deadline: `--timeout` is per socket operation and a
+        # server dripping bytes resets it on every chunk, so this is the only
+        # bound on a slow-drip transfer.
+        err = raises("the wall-clock deadline is enforced", _stream_to_file,
+                     _FakeResponse([b"x", b"x", b"x"]), dst, 1000,
+                     time.monotonic() - 1)
+        check("...and says so in words", "wall-clock" in err, True)
+        # read1, not read: a `read(CHUNK)` blocks until CHUNK bytes have
+        # accumulated, so the deadline above would never be reached.
+        check("_stream_to_file prefers read1 over read",
+              _stream_to_file(_FakeResponse([b"ab"]), dst, 1000, far), 2)
+        # the wiring download_one uses: the declared length comes off headers
+        resp = _FakeResponse([b"abc"], {"Content-Length": "99"})
+        declared = resp.headers.get("Content-Length")
+        raises("the declared length is read off the response headers",
+               _stream_to_file, resp, dst, 1000, far,
+               int(declared) if declared and declared.isdigit() else None)
+
+        # --- data: URIs, and one end-to-end download with no socket ---------
+        b64 = base64.b64encode(_PNG).decode("ascii")
+        data_url = "data:image/png;base64," + b64
+        check("_fetch_data_uri decodes and reports the mime type",
+              _fetch_data_uri(data_url, dst), "image/png")
+        check("...and writes the bytes", open(dst, "rb").read(), _PNG)
+        raises("a malformed data: URI is refused", _fetch_data_uri,
+               "data:not-a-uri", dst)
+        raises("a data: URI over the cap is refused", _fetch_data_uri,
+               data_url, dst, 10)
+        oversized_b64 = ("data:application/octet-stream;base64,"
+                         + base64.b64encode(b"x" * 52).decode("ascii"))
+        with patch.object(base64, "b64decode",
+                          side_effect=AssertionError("must fail before decode")):
+            raises("an unescaped oversized base64 URI is rejected before allocation",
+                   _fetch_data_uri, oversized_b64, dst, 50)
+        percent_b64 = oversized_b64.replace("=", "%3D")
+        raises("a percent-escaped base64 URI is bounded while decoding",
+               _fetch_data_uri, percent_b64, dst, 50)
+        raises("data URI decoding observes the whole-transfer deadline",
+               _fetch_data_uri, "data:text/plain,abc", dst, 100,
+               time.monotonic() - 1)
+        raises("invalid base64 is refused rather than decoded permissively",
+               _fetch_data_uri, "data:text/plain;base64,@@@@", dst, 100)
+        # RFC 2397 allows parameters on the mediatype, and real pages carry
+        # them: `;charset=utf-8` before `;base64`, and the plain-text
+        # inline-SVG `;utf8` form.  Both used to be refused as malformed, so
+        # a legitimately clipped image was reported failed.
+        check("a mediatype parameter before ;base64 still decodes",
+              _fetch_data_uri("data:image/png;charset=utf-8;base64," + b64,
+                              dst), "image/png")
+        check("...and writes the same bytes", open(dst, "rb").read(), _PNG)
+        svg_body = b"<svg xmlns='http://www.w3.org/2000/svg'/>"
+        svg_uri = "data:image/svg+xml;utf8," + svg_body.decode("ascii")
+        check("the plain-form ;utf8 SVG data: URI decodes as text",
+              _fetch_data_uri(svg_uri, dst), "image/svg+xml")
+        check("...to the literal SVG bytes", open(dst, "rb").read(), svg_body)
+        check("a parameterless plain-form URI still decodes",
+              _fetch_data_uri("data:text/plain,hi%20there", dst),
+              "text/plain")
+        check("...percent-decoded", open(dst, "rb").read(), b"hi there")
+        # RFC 2397's data production is URL characters, so a base64 payload
+        # may percent-escape its padding and plus signs — browsers unquote
+        # before decoding, and refusing the escapes failed an image the
+        # browser renders fine.
+        check("percent-escaped base64 padding decodes",
+              (_fetch_data_uri("data:image/png;base64,"
+                               + b64.replace("=", "%3D"), dst),
+               open(dst, "rb").read()),
+              ("image/png", _PNG)),
+        check("...and percent-escaped `+` decodes to the same bytes",
+              (_fetch_data_uri("data:image/png;base64,"
+                               + b64.replace("+", "%2B"), dst),
+               open(dst, "rb").read()),
+              ("image/png", _PNG))
+        check("a bare `data:,` payload has no mime and no bytes",
+              (_fetch_data_uri("data:,x", dst), open(dst, "rb").read()),
+              (None, b"x"))
+        # `base64` with no `;` before it is a (bogus) mediatype, not the flag.
+        check("`data:base64,` reads base64 as the mediatype, not the flag",
+              (_fetch_data_uri("data:base64,x", dst),
+               open(dst, "rb").read()), ("base64", b"x"))
+
+        def strays():
+            """`_temp_path`'s files, which every path through download_one must
+            clean up, in this run's isolated temporary directory."""
+            return {f for f in os.listdir(tempfile.gettempdir())
+                    if f.startswith("clipping_img.")}
+
+        before = strays()
+        res = download_one(data_url, att, "Teslo_Cancer_2026", 1)
+        check("download_one writes <slug>_fig_<N>.<ext> without echoing data",
+              (res["ok"], res["filename"], res["url"]),
+              (True, "Teslo_Cancer_2026_fig_1.png",
+               "data:image/png;base64,<payload omitted>"))
+        check("...inside the attachments folder",
+              os.path.isfile(os.path.join(att, "Teslo_Cancer_2026_fig_1.png")),
+              True)
+        downloaded_mode = stat.S_IMODE(os.stat(res["path"]).st_mode)
+        check("...world-readable, not mkstemp's 0600", downloaded_mode, 0o644)
+        check("...and leaves no temp file behind", strays() - before, set())
+        # the occupied-slot refusal: `shutil.move` replaces silently, so a
+        # re-run with the wrong --start destroyed the figures already filed
+        res2 = download_one(data_url, att, "Teslo_Cancer_2026", 1)
+        check("a taken figure slot is refused, not overwritten",
+              (res2["ok"], "already exists" in (res2["error"] or "")),
+              (False, True))
+        check("...and the file that was there is untouched",
+              open(os.path.join(att, "Teslo_Cancer_2026_fig_1.png"), "rb").read(),
+              _PNG)
+        missing_owner = download_one(data_url, att, "Teslo_Cancer_2026", 1,
+                                     overwrite=True)
+        check("--overwrite without exact clipping-note evidence is refused",
+              (missing_owner["ok"], "--owner-note" in (missing_owner["error"] or ""),
+               open(os.path.join(att, "Teslo_Cancer_2026_fig_1.png"), "rb").read()),
+              (False, True, _PNG))
+        foreign_articles = os.path.join(tmp, "other-vault", "Articles")
+        os.makedirs(foreign_articles)
+        foreign_owner = os.path.join(foreign_articles, "Teslo_Cancer_2026.md")
+        with open(foreign_owner, "w", encoding="utf-8") as fh:
+            fh.write("---\nsources:\n  - https://example.com/other\n---\n"
+                     "![[Teslo_Cancer_2026_fig_1.png]]\n")
+        foreign = download_one(data_url, att, "Teslo_Cancer_2026", 1,
+                               overwrite=True, owner_note=foreign_owner)
+        check("a similarly named note in another vault cannot authorize overwrite",
+              (foreign["ok"], "this Sources/Images vault" in
+               (foreign["error"] or "")), (False, True))
+        image_alias = os.path.join(tmp, "images-alias")
+        os.symlink(att, image_alias)
+        before_alias_attempt = open(os.path.join(
+            att, "Teslo_Cancer_2026_fig_1.png"), "rb").read()
+        alias_foreign = download_one(
+            data_url, image_alias, "Teslo_Cancer_2026", 1,
+            overwrite=True, owner_note=foreign_owner)
+        check("a symlink alias cannot hide the canonical image vault from owner binding",
+              (alias_foreign["ok"], "this Sources/Images vault" in
+               (alias_foreign["error"] or ""),
+               open(os.path.join(att, "Teslo_Cancer_2026_fig_1.png"),
+                    "rb").read()),
+              (False, True, before_alias_attempt))
+
+        identity_owner = current_owner(att, "Teslo_Cancer_2026")
+        real_realpath = os.path.realpath
+
+        def parent_case_variant(path):
+            resolved = real_realpath(path)
+            if os.path.abspath(path) == os.path.abspath(articles):
+                return resolved.swapcase()
+            return resolved
+
+        with patch.object(os.path, "realpath", side_effect=parent_case_variant):
+            identity_evidence = _load_clipping_owner(
+                identity_owner, "Teslo_Cancer_2026", att)
+        check("owner binding compares Articles directory identity, not realpath spelling",
+              identity_evidence["path"], os.path.abspath(identity_owner))
+        inert_owner = clipping_note(
+            "Teslo_Cancer_2026", (), body_prefix=(
+                "\n```md\n![[Teslo_Cancer_2026_fig_1.png]]\n```\n"
+                "<!-- ![[Teslo_Cancer_2026_fig_1.png]] -->\n"))
+        inert = download_one(data_url, att, "Teslo_Cancer_2026", 1,
+                             overwrite=True, owner_note=inert_owner)
+        check("embed-shaped text in code or comments cannot claim an attachment",
+              (inert["ok"], "not an exact rendered" in (inert["error"] or "")),
+              (False, True))
+        scalar_owner = os.path.join(articles, "Teslo_Cancer_2026.md")
+        with open(scalar_owner, "w", encoding="utf-8") as fh:
+            fh.write("---\nsources:\n  - https://example.com/current\n"
+                     "review_notes: |\n  ---\n"
+                     "  ![[Teslo_Cancer_2026_fig_1.png]]\n---\n"
+                     "Actual body without an image embed.\n")
+        scalar_claim = download_one(
+            data_url, att, "Teslo_Cancer_2026", 1,
+            overwrite=True, owner_note=scalar_owner)
+        check("an embed in a YAML block scalar cannot claim an attachment",
+              (scalar_claim["ok"], "not an exact rendered" in
+               (scalar_claim["error"] or ""),
+               open(os.path.join(
+                   att, "Teslo_Cancer_2026_fig_1.png"), "rb").read()),
+              (False, True, _PNG))
+        wrong_source_owner = clipping_note(
+            "Teslo_Cancer_2026", ("Teslo_Cancer_2026_fig_1.png",),
+            source="[[Sources/PDFs/Teslo_Cancer_2026.pdf]]")
+        wrong_source = download_one(data_url, att, "Teslo_Cancer_2026", 1,
+                                    overwrite=True,
+                                    owner_note=wrong_source_owner)
+        check("a PDF wikilink cannot make a note a clipping-image owner",
+              (wrong_source["ok"], "HTTP(S) URL" in (wrong_source["error"] or "")),
+              (False, True))
+        legacy_owner = os.path.join(articles, "Teslo_Cancer_2026.md")
+        with open(legacy_owner, "w", encoding="utf-8") as fh:
+            fh.write("---\nsource: https://example.com/legacy\n---\n"
+                     "![[Teslo_Cancer_2026_fig_1.png]]\n")
+        legacy = download_one(data_url, att, "Teslo_Cancer_2026", 1,
+                              overwrite=True, owner_note=legacy_owner)
+        check("legacy source fallback alone cannot authorize a destructive image action",
+              (legacy["ok"], "first current sources item" in
+               (legacy["error"] or "")), (False, True))
+        for label, metadata, allowed in (
+                ("quoted current list authorizes its own image",
+                 '"sources": ["https://example.invalid/current"]\n'
+                 'source: https://stale.invalid/\n', True),
+                ("decoded duplicate current keys cannot authorize overwrite",
+                 '"sources": ["https://example.invalid/current"]\n'
+                 'sources: ["https://wrong.invalid/"]\n', False),
+                ("a malformed later member cannot authorize overwrite",
+                 'sources:\n  - https://example.invalid/current\n  - null\n', False)):
+            with open(legacy_owner, "w", encoding="utf-8") as fh:
+                fh.write("---\n" + metadata + "---\n![[Teslo_Cancer_2026_fig_1.png]]\n")
+            with patch.dict(globals(), _fetch_to_path=(
+                    lambda *args, **kwargs: (_ for _ in ()).throw(
+                        AssertionError("unverified owner reached transport")))) if not allowed \
+                    else contextlib.nullcontext():
+                origin_result = download_one(data_url, att, "Teslo_Cancer_2026", 1,
+                                             overwrite=True, owner_note=legacy_owner)
+            check(label, (origin_result["ok"], open(os.path.join(
+                att, "Teslo_Cancer_2026_fig_1.png"), "rb").read()), (allowed, _PNG))
+        check("--overwrite is what replaces it",
+              download_one(data_url, att, "Teslo_Cancer_2026", 1,
+                           overwrite=True,
+                           owner_note=current_owner(
+                               att, "Teslo_Cancer_2026"))["ok"], True)
+        # A failed cross-device move used to remove the previous good image.
+        # Simulate an interrupted stage copy after it wrote bytes. The complete
+        # private download is retained and named in the result; no public path
+        # is exposed and no previous image changes.
+        real_snapshot = _stable_regular_snapshot
+
+        def interrupted_snapshot(path, copy_to=None, copy_mode=None):
+            if copy_to is None:
+                return real_snapshot(path)
+            if path.endswith(".md"):
+                return real_snapshot(path, copy_to=copy_to, copy_mode=copy_mode)
+            with open(copy_to, "xb") as fh:
+                fh.write(b"incomplete")
+            raise OSError(errno.ENOSPC, "injected disk-full copy")
+
+        keep_image = os.path.join(att, "Teslo_Cancer_2026_fig_1.png")
+        image_owner = current_owner(att, "Teslo_Cancer_2026")
+        with patch.dict(globals(), _stable_regular_snapshot=interrupted_snapshot):
+            failed_replace = download_one(data_url, att, "Teslo_Cancer_2026", 1,
+                                          overwrite=True,
+                                          owner_note=image_owner)
+            failed_new = download_one(data_url, att, "Teslo_Cancer_2026", 99)
+        check("a failed overwrite preserves the previous complete download",
+              (failed_replace["ok"], os.path.exists(keep_image)
+               and open(keep_image, "rb").read()), (False, _PNG))
+        check("an interrupted new download exposes no final figure",
+              (failed_new["ok"], _glob_slug(att, "Teslo_Cancer_2026", "_fig_99.*")),
+              (False, []))
+        retained_scratch = [failed_replace.get("scratch"),
+                            failed_new.get("scratch")]
+        check("failed stage copies retain and report their complete downloads",
+              [(bool(path and os.path.isfile(path)),
+                open(path, "rb").read() if path and os.path.isfile(path) else None)
+               for path in retained_scratch],
+              [(True, _PNG), (True, _PNG)])
+        for path in retained_scratch:
+            os.remove(path)
+        check("failed publications leave no staging directories",
+              glob.glob(os.path.join(os.path.dirname(att), ".clipping-stage.*")), [])
+
+        no_link_source = touch(os.path.join(tmp, "no-hard-link-source.png"), _PNG)
+        no_link_target = os.path.join(att, "No_Hard_Link_2026_fig_1.png")
+
+        def unavailable_link(source, target, *args, **kwargs):
+            raise LinkUnavailable(
+                source, target,
+                OSError(errno.ENOTSUP, "injected filesystem has no hard links"))
+
+        with patch.dict(globals(), publish_new=unavailable_link):
+            no_link_result = place_file(
+                no_link_source, att, "No_Hard_Link_2026", 1)
+        no_link_error = no_link_result["error"] or ""
+        check("a hard-link refusal retains and reports the original complete source",
+              (no_link_result["ok"],
+               "LinkUnavailable" in no_link_error,
+               (no_link_source in no_link_error
+                or repr(no_link_source) in no_link_error),
+               ".clipping-stage." in no_link_error,
+               no_link_result["source"], open(no_link_source, "rb").read(),
+               os.path.lexists(no_link_target),
+               glob.glob(os.path.join(os.path.dirname(att),
+                                      ".clipping-stage.*"))),
+              (False, True, True, False, no_link_source, _PNG, False, []))
+
+        # Publication authorization belongs to the exact source and target
+        # snapshots, not merely their pathnames. Exercise the gaps on both
+        # sides of the shared displacement protocol.
+        late_src = touch(os.path.join(tmp, "late-target-source.png"), _PNG)
+        late_target = touch(os.path.join(att, "Late_Target_2026_fig_1.png"),
+                            b"planned predecessor")
+
+        def replace_target_before_publish():
+            os.unlink(late_target)
+            touch(late_target, b"later editor save")
+
+        try:
+            _publish_file(late_src, late_target, True,
+                          os.path.dirname(att), 0o644,
+                          replace_target_before_publish)
+            late_error = None
+        except PublicationConflict as exc:
+            late_error = str(exc)
+        check("overwrite refuses a target replaced after its snapshot",
+              bool(late_error), True)
+        check("the late target and unpublished source both survive",
+              (open(late_target, "rb").read(), open(late_src, "rb").read(),
+               bool(late_error and ("changed" in late_error
+                                    or "predecessor" in late_error))),
+              (b"later editor save", _PNG, True))
+
+        mode_src = touch(os.path.join(tmp, "mode-source.png"), _PNG)
+        mode_target = touch(os.path.join(att, "Mode_Target_2026_fig_1.png"),
+                            b"old")
+        os.chmod(mode_target, 0o640)
+        predecessor_mode = stat.S_IMODE(os.stat(mode_target).st_mode)
+        _publish_file(mode_src, mode_target, True,
+                      staging_parent=os.path.dirname(att))
+        check("an overwrite preserves the predecessor's permission bits",
+              (open(mode_target, "rb").read(),
+               stat.S_IMODE(os.stat(mode_target).st_mode),
+               os.path.lexists(mode_src)),
+              (_PNG, predecessor_mode, False))
+
+        readback_src = touch(os.path.join(tmp, "readback-source.png"), _PNG)
+        readback_target = touch(
+            os.path.join(att, "Readback_Target_2026_fig_1.png"), b"old bytes")
+        injected_readback = {"done": False}
+
+        def mutate_public_readback(path, copy_to=None, copy_mode=None):
+            if (copy_to is None and os.path.abspath(path) == readback_target
+                    and not injected_readback["done"]
+                    and os.path.isfile(path)
+                    and open(path, "rb").read() == _PNG):
+                injected_readback["done"] = True
+                with open(path, "wb") as fh:
+                    fh.write(b"later in-place edit")
+            return real_snapshot(path, copy_to=copy_to, copy_mode=copy_mode)
+
+        with patch.dict(globals(),
+                        _stable_regular_snapshot=mutate_public_readback):
+            try:
+                _publish_file(readback_src, readback_target, True,
+                              staging_parent=os.path.dirname(att))
+                readback_error = None
+            except PublicationConflict as exc:
+                readback_error = exc
+        recovered_old = (readback_error.recovery_path
+                         if readback_error is not None else None)
+        check("a post-link editor save is retained and the predecessor is recovered",
+              (bool(readback_error), open(readback_target, "rb").read(),
+               open(readback_src, "rb").read(),
+               open(recovered_old, "rb").read()
+               if recovered_old and os.path.isfile(recovered_old) else None),
+              (True, b"later in-place edit", _PNG, b"old bytes"))
+
+        slot_src = touch(os.path.join(tmp, "slot-source.png"), _PNG)
+        slot_target = os.path.join(att, "Late_Slot_2026_fig_1.png")
+        slot_twin = os.path.join(att, "Late_Slot_2026_fig_1.webp")
+
+        def create_slot_twin():
+            touch(slot_twin, b"late extension twin")
+            _refuse_existing(att, "Late_Slot_2026", 1, True, "png")
+
+        raises("a late extension twin rolls a new publication back",
+               _publish_file, slot_src, slot_target, False,
+               os.path.dirname(att), 0o644, None, create_slot_twin)
+        check("the late twin survives while our target and source return to pre-run state",
+              (os.path.lexists(slot_target), open(slot_twin, "rb").read(),
+               open(slot_src, "rb").read()),
+              (False, b"late extension twin", _PNG))
+
+        slot_replace_src = touch(os.path.join(tmp, "slot-replace-source.png"),
+                                 _PNG)
+        slot_replace_target = touch(
+            os.path.join(att, "Late_Replace_2026_fig_1.png"), b"old figure")
+        slot_replace_twin = os.path.join(
+            att, "Late_Replace_2026_fig_1.webp")
+
+        def create_replace_twin():
+            touch(slot_replace_twin, b"late twin")
+            _refuse_existing(att, "Late_Replace_2026", 1, True, "png")
+
+        raises("a late extension twin restores an overwritten predecessor",
+               _publish_file, slot_replace_src, slot_replace_target, True,
+               os.path.dirname(att), 0o644, None, create_replace_twin)
+        check("slot rollback preserves predecessor, twin, and source",
+              (open(slot_replace_target, "rb").read(),
+               open(slot_replace_twin, "rb").read(),
+               open(slot_replace_src, "rb").read()),
+              (b"old figure", b"late twin", _PNG))
+
+        changed_source = touch(os.path.join(tmp, "changed-source.png"), _PNG)
+        changed_target = os.path.join(att, "Changed_Source_2026_fig_1.png")
+        real_remove_expected = remove_expected
+        changed_once = {"done": False}
+
+        def replace_source_before_cleanup(target, *args, **kwargs):
+            if target == changed_source and not changed_once["done"]:
+                changed_once["done"] = True
+                os.unlink(changed_source)
+                touch(changed_source, b"later source occupant")
+            return real_remove_expected(target, *args, **kwargs)
+
+        with patch.dict(globals(), remove_expected=replace_source_before_cleanup):
+            cleanup_warning = _publish_file(
+                changed_source, changed_target,
+                staging_parent=os.path.dirname(att))
+        check("source cleanup removes only the copied snapshot",
+              (open(changed_target, "rb").read(),
+               open(changed_source, "rb").read(),
+               "retained" in (cleanup_warning or "")),
+              (_PNG, b"later source occupant", True))
+        # An explicit overwrite grants replacement of this clipping's figure,
+        # never a file another producer has recorded as its own.
+        pdf_owned = os.path.join(tmp, "pdf-owned")
+        os.makedirs(pdf_owned)
+        owned_name = "Doe_Paper_2026_fig_1.png"
+        owned_file = touch(os.path.join(pdf_owned, owned_name), _PNG)
+        with open(os.path.join(pdf_owned, MANIFEST_FILE), "w",
+                  encoding="utf-8") as fh:
+            fh.write(owned_name + "\t" + hashlib.sha256(_PNG).hexdigest() + "\n")
+        pdf_owner = current_owner(pdf_owned, "Doe_Paper_2026")
+        blocked_download = download_one(data_url, pdf_owned, "Doe_Paper_2026", 1,
+                                        overwrite=True, owner_note=pdf_owner)
+        owned_render = touch(os.path.join(tmp, "owned-render.png"), _PNG)
+        blocked_place = place_file(owned_render, pdf_owned, "Doe_Paper_2026", 1,
+                                   overwrite=True, owner_note=pdf_owner)
+        check("overwrite never replaces a PDF-manifest-owned figure",
+              (blocked_download["ok"], blocked_place["ok"],
+               open(owned_file, "rb").read(), os.path.exists(owned_render)),
+              (False, False, _PNG, True))
+        check("recorded PDF figures cannot be renamed by a clipping either",
+              [row["ok"] for row in checked_plan(
+                  pdf_owned, "Doe_Paper_2026", "New_Note_2026")],
+              [False])
+        with open(os.path.join(pdf_owned, MANIFEST_FILE), "w",
+                  encoding="utf-8") as fh:
+            fh.write("not a valid ownership record\n")
+        check("a malformed ownership manifest does not authorize a write",
+              download_one(data_url, pdf_owned, "New_Clipping_2026", 1)["ok"], False)
+        # the slot is `<slug>_fig_<N>.*`, not one filename: a .webp at the same
+        # index is the same slot, or the extension-twin comes back
+        touch(os.path.join(att, "Teslo_Cancer_2026_fig_2.webp"))
+        check("a different extension at the same index is the same slot",
+              download_one(data_url, att, "Teslo_Cancer_2026", 2)["ok"], False)
+        old_webp = os.path.join(att, "Teslo_Cancer_2026_fig_2.webp")
+        render_png = touch(os.path.join(tmp, "changed-format.png"), _PNG)
+        format_owner = current_owner(att, "Teslo_Cancer_2026")
+        replaced = download_one(data_url, att, "Teslo_Cancer_2026", 2,
+                                overwrite=True, owner_note=format_owner)
+        placed = place_file(render_png, att, "Teslo_Cancer_2026", 2,
+                            overwrite=True, owner_note=format_owner)
+        check("overwrite cannot create extension twins on either publication path",
+              (replaced["ok"], placed["ok"], open(old_webp, "rb").read(),
+               os.path.exists(render_png),
+               os.path.exists(os.path.join(att, "Teslo_Cancer_2026_fig_2.png"))),
+              (False, False, b"x", True, False))
+        # ...even when the owner embeds both spellings, so ownership passes
+        # and only the slot's extension-twin check stands in the way.
+        twin_owner = current_owner(att, "Teslo_Cancer_2026",
+                                   ("Teslo_Cancer_2026_fig_2.png",))
+        twin_render = touch(os.path.join(tmp, "twin-format.png"), _PNG)
+        replaced = download_one(data_url, att, "Teslo_Cancer_2026", 2,
+                                overwrite=True, owner_note=twin_owner)
+        placed = place_file(twin_render, att, "Teslo_Cancer_2026", 2,
+                            overwrite=True, owner_note=twin_owner)
+        check("an owned second format at one index is still an extension twin",
+              (replaced["ok"], placed["ok"],
+               "different filename or format" in (placed["error"] or ""),
+               os.path.exists(os.path.join(att, "Teslo_Cancer_2026_fig_2.png"))),
+              (False, False, True, False))
+        misleading = "data:image/png;base64," + base64.b64encode(
+            b"\x00\xffnot an image\x01").decode("ascii")
+        nonimage = download_one(misleading, att, "Teslo_Cancer_2026", 70)
+        check("arbitrary binary data with an image MIME label never lands",
+              (nonimage["ok"], _glob_slug(att, "Teslo_Cancer_2026", "_fig_70.*")),
+              (False, []))
+        bracketed = os.path.join(tmp, "Vault [research]", "Images")
+        os.makedirs(bracketed)
+        lower_image = touch(os.path.join(bracketed, "teslo_cancer_2026_fig_1.webp"))
+        check("case variants in a bracketed vault path still occupy the slot",
+              download_one(data_url, bracketed, "Teslo_Cancer_2026", 1)["ok"], False)
+        check("the occupied file is retained", open(lower_image, "rb").read(), b"x")
+        # a non-image is a failure, not a .png in the vault
+        res = download_one("data:text/html;base64," + base64.b64encode(
+            b"<!DOCTYPE html><html>nope</html>").decode("ascii"),
+            att, "Teslo_Cancer_2026", 7)
+        check("a non-image data: URI fails rather than landing as .png",
+              (res["ok"], os.path.exists(os.path.join(
+                  att, "Teslo_Cancer_2026_fig_7.png"))), (False, False))
+        # ...and end to end with the header LYING about it, which is the shape
+        # a CDN error body actually arrives in: `Content-Type: image/png` on a
+        # JSON document. This used to land in the vault as a .png, reported ok.
+        res = download_one("data:image/png;base64," + base64.b64encode(
+            b'{"error": "not found"}').decode("ascii"),
+            att, "Teslo_Cancer_2026", 10)
+        check("a JSON body served as image/png fails, and writes nothing",
+              (res["ok"], _glob_slug(att, "Teslo_Cancer_2026", "_fig_10.*")),
+              (False, []))
+        check("...and the error names what the bytes actually looked like",
+              "a JSON body" in (res["error"] or ""), True)
+        # ...end to end for the two parameterised data: URI forms (RFC 2397).
+        res = download_one("data:image/png;charset=utf-8;base64," + b64,
+                           att, "Teslo_Cancer_2026", 30)
+        check("download_one accepts a parameterised base64 data: URI",
+              (res["ok"], res["filename"]),
+              (True, "Teslo_Cancer_2026_fig_30.png"))
+        res = download_one(
+            "data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg'/>",
+            att, "Teslo_Cancer_2026", 31)
+        check("...and the ;utf8 inline-SVG form lands by its bytes, as .svg",
+              (res["ok"], res["filename"]),
+              (True, "Teslo_Cancer_2026_fig_31.svg"))
+        active_svg = (
+            "data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' "
+            "onload='bad()'/>")
+        res = download_one(active_svg, att, "Teslo_Cancer_2026", 32)
+        check("an active SVG is refused before vault publication",
+              (res["ok"], "event-handler" in (res["error"] or ""),
+               _glob_slug(att, "Teslo_Cancer_2026", "_fig_32.*"), res["url"]),
+              (False, True, [],
+               "data:image/svg+xml;utf8,<payload omitted>"))
+        res = download_one("data:image/svg+xml;utf8,<svg width='1'><rect/></svg>",
+                           att, "Teslo_Cancer_2026", 33)
+        check("an SVG without the SVG namespace is refused before publication",
+              (res["ok"], "without xmlns" in (res["error"] or ""),
+               _glob_slug(att, "Teslo_Cancer_2026", "_fig_33.*")),
+              (False, True, []))
+        # Obsidian does not display TIFF or ICO. `stage` keeps the download in
+        # its scratch folder as conversion input and never offers it as a figure.
+        convert_stage = os.path.join(tmp, "stage-convert")
+        for number, label, payload, mime in (
+                (1, "tiff", b"II\x2a\x00\x08\x00\x00\x00", "image/tiff"),
+                (2, "ico", b"\x00\x00\x01\x00\x01\x00\x10\x10\x00\x00",
+                 "image/x-icon")):
+            res = download_one(
+                "data:%s;base64,%s" % (mime, base64.b64encode(payload)
+                                       .decode("ascii")),
+                convert_stage, "Teslo_Cancer_2026", number)
+            kept = os.path.join(convert_stage,
+                                "Teslo_Cancer_2026_fig_%d.%s" % (number, label))
+            check("stage keeps a %s in scratch for PNG conversion" % label.upper(),
+                  (res["ok"], res.get("needs_conversion"), res["filename"],
+                   res["path"], os.path.isfile(kept) and open(kept, "rb").read(),
+                   "embed Teslo_Cancer_2026_fig_%d.png" % number
+                   in (res["error"] or "")),
+                  (False, "png", None, kept, payload, True))
+        # --- fetch / place: the Lottie path, which used to bypass all of this -
+        # A heredoc did its own urlopen and its own os.replace into
+        # Sources/Images: no scheme allowlist, no private-host refusal, no
+        # size or wall-clock cap, no slug validation, no containment check and
+        # no occupied-slot refusal — and the folder is shared with two other
+        # skills, so the GIF it overwrote was not necessarily this note's.
+        for url, label in (("file:///etc/passwd", "file:"),
+                           ("ftp://example.com/a.json", "ftp:"),
+                           ("javascript:alert(1)", "javascript:")):
+            check("fetch refuses %s, like download does" % label,
+                  fetch_source(url)["ok"], False)
+        anim = b'{"v":"5.7","w":100,"h":100,"fr":30,"ip":0,"op":60,"layers":[]}'
+        got = fetch_source("data:application/json;base64,"
+                           + base64.b64encode(anim).decode("ascii"))
+        check("fetch accepts a Lottie JSON source and identifies its format",
+              (got["ok"], got["source_format"],
+               open(got["path"], "rb").read()), (True, "json", anim))
+        check("...to a path outside the attachments folder",
+              os.path.realpath(got["path"]).startswith(
+                  os.path.realpath(att) + os.sep), False)
+        check("...under the same size cap as download",
+              fetch_source("data:application/json;base64,"
+                           + base64.b64encode(anim).decode("ascii"),
+                           max_bytes=10)["ok"], False)
+        os.remove(got["path"])
+        for payload, label in ((b"<!doctype html><html>", "HTML"),
+                               (b"MZ\x90\x00", "an executable"),
+                               (b'{"message":"not an animation"}',
+                                "unrelated JSON")):
+            refused = fetch_source(
+                "data:application/octet-stream;base64,"
+                + base64.b64encode(payload).decode("ascii"))
+            check("fetch refuses %s rather than accepting arbitrary bytes" % label,
+                  (refused["ok"], refused["path"]), (False, None))
+
+        packed = os.path.join(tmp, "valid.lottie")
+        with zipfile.ZipFile(packed, "w", zipfile.ZIP_DEFLATED) as archive:
+            archive.writestr(
+                "manifest.json",
+                '{"version":"1","animations":[{"id":"a"}]}')
+            archive.writestr("animations/a.json", anim)
+        packed_bytes = open(packed, "rb").read()
+        dot = fetch_source(
+            "data:application/octet-stream;base64,"
+            + base64.b64encode(packed_bytes).decode("ascii"))
+        check("fetch accepts a dotLottie ZIP containing bounded animation JSON",
+              (dot["ok"], dot["source_format"]), (True, "dotlottie"))
+        os.remove(dot["path"])
+
+        duplicate_manifest = os.path.join(tmp, "duplicate-manifest.lottie")
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore", UserWarning)
+            with zipfile.ZipFile(
+                    duplicate_manifest, "w", zipfile.ZIP_DEFLATED) as archive:
+                # The old validator selected this first occurrence by iterating
+                # infolist(), while the renderer's getinfo() selected the last.
+                archive.writestr(
+                    "manifest.json",
+                    '{"version":"1","animations":[{"id":"a"}]}')
+                archive.writestr("animations/a.json", anim)
+                archive.writestr(
+                    "manifest.json",
+                    '{"version":"1","animations":[{"id":"b"}]}')
+                archive.writestr("animations/b.json", anim)
+        raises("dotLottie refuses duplicate manifest member names",
+               _validate_lottie_source, duplicate_manifest, DEFAULT_MAX_BYTES)
+
+        duplicate_animation = os.path.join(tmp, "duplicate-animation.lottie")
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore", UserWarning)
+            with zipfile.ZipFile(
+                    duplicate_animation, "w", zipfile.ZIP_DEFLATED) as archive:
+                archive.writestr(
+                    "manifest.json",
+                    '{"version":"1","animations":[{"id":"a"}]}')
+                archive.writestr("animations/a.json", anim)
+                archive.writestr(
+                    "animations/a.json", anim.replace(b'"w":100', b'"w":1'))
+        raises("dotLottie refuses duplicate selected-animation member names",
+               _validate_lottie_source, duplicate_animation, DEFAULT_MAX_BYTES)
+
+        selected_pack = os.path.join(tmp, "selected-v2.lottie")
+        selected_manifest = {
+            "version": "2", "initial": {"animation": "chosen"},
+            "animations": [{"id": "decoy"}, {"id": "chosen"}],
+            "themes": [{"id": "first-in-zip"}],
+        }
+        with zipfile.ZipFile(selected_pack, "w", zipfile.ZIP_DEFLATED) as archive:
+            # Archive order is adversarial: theme/state metadata appears before
+            # two animations, while the manifest selects the second animation.
+            archive.writestr("t/first-in-zip.json", '{"rules":[]}')
+            archive.writestr("a/decoy.json", anim.replace(b'"w":100', b'"w":1'))
+            archive.writestr("a/chosen.json", anim)
+            archive.writestr("manifest.json", json.dumps(selected_manifest))
+        selected_bytes = open(selected_pack, "rb").read()
+        selected = fetch_source(
+            "data:application/zip;base64,"
+            + base64.b64encode(selected_bytes).decode("ascii"))
+        check("dotLottie selection follows v2 initial.animation, not ZIP order",
+              (selected["ok"], _dotlottie_animation_path(selected_manifest)),
+              (True, "a/chosen.json"))
+        os.remove(selected["path"])
+        check("dotLottie v1 activeAnimationId selects its manifest animation",
+              _dotlottie_animation_path({
+                  "version": "1.0", "activeAnimationId": "two",
+                  "animations": [{"id": "one"}, {"id": "two"}],
+              }), "animations/two.json")
+
+        missing_pack = os.path.join(tmp, "missing-selected.lottie")
+        with zipfile.ZipFile(missing_pack, "w", zipfile.ZIP_DEFLATED) as archive:
+            archive.writestr("a/decoy.json", anim)
+            archive.writestr("manifest.json", json.dumps({
+                "version": "2", "initial": {"animation": "real"},
+                "animations": [{"id": "real"}],
+            }))
+        missing_bytes = open(missing_pack, "rb").read()
+        missing = fetch_source(
+            "data:application/zip;base64,"
+            + base64.b64encode(missing_bytes).decode("ascii"))
+        check("an unrelated Lottie JSON cannot satisfy a missing manifest target",
+              (missing["ok"], missing["path"]), (False, None))
+        raises("a manifest animation id cannot escape its versioned directory",
+               _dotlottie_animation_path,
+               {"version": "2", "animations": [{"id": "../evil"}]})
+
+        arbitrary_zip = os.path.join(tmp, "arbitrary.zip")
+        with zipfile.ZipFile(arbitrary_zip, "w", zipfile.ZIP_DEFLATED) as archive:
+            archive.writestr("payload.txt", "not an animation")
+        arbitrary_zip_bytes = open(arbitrary_zip, "rb").read()
+        refused = fetch_source(
+            "data:application/zip;base64,"
+            + base64.b64encode(arbitrary_zip_bytes).decode("ascii"))
+        check("fetch refuses an arbitrary ZIP that is not dotLottie",
+              (refused["ok"], refused["path"]), (False, None))
+
+        out_path = os.path.join(tmp, "anim.json")
+        boundary_vault = os.path.join(tmp, "boundary-vault")
+        os.makedirs(boundary_vault)
+        touch(out_path, b"mine")
+        check("fetch refuses an --out that already exists",
+              fetch_source("data:application/json,x", out_path,
+                           vault=boundary_vault)["ok"], False)
+        check("...and leaves it untouched", open(out_path, "rb").read(), b"mine")
+        bad = fetch_source("file:///not-a-permitted-source", out_path,
+                           overwrite=True, vault=boundary_vault)
+        check("fetch validation failure never deletes an overwrite destination",
+              (bad["ok"], os.path.exists(out_path) and open(out_path, "rb").read()),
+              (False, b"mine"))
+        bad = fetch_source("data:text/html,%3Chtml%3E", out_path,
+                           overwrite=True, vault=boundary_vault)
+        check("a non-Lottie response never replaces an overwrite destination",
+              (bad["ok"], os.path.exists(out_path) and open(out_path, "rb").read()),
+              (False, b"mine"))
+        def interrupted_fetch(url, destination, *args, **kwargs):
+            touch(destination, b"partial response")
+            raise TimeoutError("injected transfer interruption")
+        new_out = os.path.join(tmp, "new-animation.json")
+        with patch.dict(globals(), {"_fetch_to_path": interrupted_fetch}):
+            new_failed = fetch_source("https://example.com/anim.json", new_out,
+                                      vault=boundary_vault)
+            old_failed = fetch_source("https://example.com/anim.json", out_path,
+                                      overwrite=True, vault=boundary_vault)
+        check("an interrupted explicit fetch leaves no retry-blocking partial file",
+              (new_failed["ok"], os.path.exists(new_out)), (False, False))
+        check("an interrupted fetch leaves the previous source byte-identical",
+              (old_failed["ok"], os.path.exists(out_path)
+               and open(out_path, "rb").read()), (False, b"mine"))
+        check("retrying an interrupted fetch works without overwrite",
+              fetch_source("data:application/json;base64,"
+                           + base64.b64encode(anim).decode("ascii"),
+                           new_out, vault=boundary_vault)["ok"], True)
+        inside_out = os.path.join(boundary_vault, "animation.json")
+        check("an explicit fetch output cannot land inside the vault",
+              (fetch_source("data:application/json;base64,"
+                            + base64.b64encode(anim).decode("ascii"),
+                            inside_out, vault=boundary_vault)["ok"],
+               os.path.lexists(inside_out)), (False, False))
+
+        # `place` is the write half, and it is the SAME guards as `download_one`.
+        gif = b"GIF89a\x01\x00\x01\x00\x00\xff\x00,"
+        render = touch(os.path.join(tmp, "render.gif"), gif)
+        res = place_file(render, att, "Teslo_Cancer_2026", 20)
+        check("place files a rendered GIF as <slug>_fig_<N>.<ext>",
+              (res["ok"], res["filename"]),
+              (True, "Teslo_Cancer_2026_fig_20.gif"))
+        check("...moving it, so no twin is left at the render path",
+              os.path.exists(render), False)
+        placed_mode = stat.S_IMODE(os.stat(res["path"]).st_mode)
+        check("...world-readable like a downloaded figure", placed_mode, 0o644)
+        # the occupied slot: `os.replace` in the heredoc overwrote a previous
+        # run's GIF and exited 0
+        render = touch(os.path.join(tmp, "render.gif"), b"GIF89a\x02\x00,")
+        res = place_file(render, att, "Teslo_Cancer_2026", 20)
+        check("place refuses an occupied figure slot, as download does",
+              (res["ok"], "already exists" in (res["error"] or "")),
+              (False, True))
+        # images.md: existing attachments are never replaced. The refusal an
+        # agent reads mid-reprocess must not steer it to --overwrite.
+        check("the occupied-slot refusal points only at the next free number",
+              ("--overwrite" in (res["error"] or ""),
+               "next free figure number" in (res["error"] or ""),
+               "--index for place" in (res["error"] or "")),
+              (False, True, True))
+        check("...and the file that was there is untouched",
+              open(os.path.join(att, "Teslo_Cancer_2026_fig_20.gif"),
+                   "rb").read(), gif)
+        check("...while --overwrite is what replaces it",
+              place_file(render, att, "Teslo_Cancer_2026", 20,
+                         overwrite=True,
+                         owner_note=current_owner(
+                             att, "Teslo_Cancer_2026"))["ok"], True)
+        # A legacy wiki-add research extract can still own a new placement, but
+        # it never authorizes clipping-clean to replace its images.
+        extract_marker = ("<!-- obsidian:wiki-add-research-source -->\n"
+                          "Research extract\n")
+        extract_embeds = [os.path.basename(path) for path in
+                          _glob_slug(att, "Teslo_Cancer_2026", _FIG_GLOB)]
+        extract_owner = clipping_note(
+            "Teslo_Cancer_2026",
+            extract_embeds + ["Teslo_Cancer_2026_fig_40.png"],
+            body_prefix=extract_marker)
+        extract_gif = os.path.join(att, "Teslo_Cancer_2026_fig_20.gif")
+        extract_before = open(extract_gif, "rb").read()
+        extract_render = touch(os.path.join(tmp, "extract-render.gif"),
+                               b"GIF89a\x03\x00,")
+        refused_extract = place_file(extract_render, att, "Teslo_Cancer_2026", 20,
+                                     overwrite=True, owner_note=extract_owner,
+                                     require_vault=True)
+        refused_download = download_one(data_url, att, "Teslo_Cancer_2026", 20,
+                                        overwrite=True, owner_note=extract_owner,
+                                        require_vault=True)
+        check("--overwrite refuses a wiki-add research extract as owner",
+              (refused_extract["ok"], refused_download["ok"],
+               "research extract" in (refused_extract["error"] or ""),
+               "research extract" in (refused_download["error"] or ""),
+               open(extract_gif, "rb").read(), os.path.exists(extract_render)),
+              (False, False, True, True, extract_before, True))
+        # The CLI's vault binding requires scratch outside the vault (tmp).
+        extract_scratch = tempfile.mkdtemp(prefix="fetch_images_extract.",
+                                           dir=os.path.dirname(tmp))
+        try:
+            extract_new = touch(os.path.join(extract_scratch, "new.png"), _PNG)
+            placed_for_extract = place_file(
+                extract_new, att, "Teslo_Cancer_2026", 40,
+                owner_note=extract_owner, require_vault=True)
+        finally:
+            shutil.rmtree(extract_scratch, ignore_errors=True)
+        check("...while a new placement for that extract still works",
+              (placed_for_extract["ok"], placed_for_extract["filename"]),
+              (True, "Teslo_Cancer_2026_fig_40.png"))
+        replacement = touch(os.path.join(tmp, "replacement.gif"), gif)
+        keep_gif = os.path.join(att, "Teslo_Cancer_2026_fig_20.gif")
+        prior_gif = open(keep_gif, "rb").read()
+        gif_owner = current_owner(att, "Teslo_Cancer_2026")
+        with patch.dict(globals(), _stable_regular_snapshot=interrupted_snapshot):
+            failed_place = place_file(replacement, att, "Teslo_Cancer_2026", 20,
+                                      overwrite=True, owner_note=gif_owner)
+        check("a failed rendered-image replacement preserves the previous GIF",
+              (failed_place["ok"], os.path.exists(keep_gif)
+               and open(keep_gif, "rb").read()), (False, prior_gif))
+        check("...and leaves the render available for retry",
+              open(replacement, "rb").read(), gif)
+        # the extension comes from the BYTES, not from the name the renderer
+        # chose: a blank or failed render named `.gif` is not a GIF
+        html = touch(os.path.join(tmp, "failed.gif"), b"<!DOCTYPE html><html>")
+        res = place_file(html, att, "Teslo_Cancer_2026", 21)
+        check("place refuses a non-image whatever the filename says",
+              (res["ok"], _glob_slug(att, "Teslo_Cancer_2026", "_fig_21.*")),
+              (False, []))
+        check("...naming what the bytes looked like",
+              "an HTML page" in (res["error"] or ""), True)
+        png = touch(os.path.join(tmp, "actually.gif"), _PNG)
+        check("...and a PNG named .gif is filed by its bytes",
+              place_file(png, att, "Teslo_Cancer_2026", 22)["filename"],
+              "Teslo_Cancer_2026_fig_22.png")
+        tiff_render = touch(os.path.join(tmp, "render.tiff"),
+                            b"II\x2a\x00\x08\x00\x00\x00")
+        res = place_file(tiff_render, att, "Teslo_Cancer_2026", 26)
+        check("place refuses a TIFF, which Obsidian does not display",
+              (res["ok"], "convert it to PNG" in (res["error"] or ""),
+               _glob_slug(att, "Teslo_Cancer_2026", "_fig_26.*"),
+               os.path.exists(tiff_render)), (False, True, [], True))
+        bare_svg = touch(os.path.join(tmp, "bare.svg"),
+                         b'<svg width="1"><rect/></svg>')
+        res = place_file(bare_svg, att, "Teslo_Cancer_2026", 26)
+        check("place refuses an SVG without the SVG namespace",
+              (res["ok"], "without xmlns" in (res["error"] or ""),
+               _glob_slug(att, "Teslo_Cancer_2026", "_fig_26.*")),
+              (False, True, []))
+        changing_render = touch(os.path.join(tmp, "changing-render.gif"), gif)
+        real_publish_file = _publish_file
+
+        def change_after_sniff(src, final, *args, **kwargs):
+            touch(src, b"late non-image replacement")
+            return real_publish_file(src, final, *args, **kwargs)
+
+        with patch.dict(globals(), {"_publish_file": change_after_sniff}):
+            changed = place_file(
+                changing_render, att, "Teslo_Cancer_2026", 25)
+        check("place refuses a source that changes after byte sniffing",
+              (changed["ok"], os.path.lexists(os.path.join(
+                  att, "Teslo_Cancer_2026_fig_25.gif"))), (False, False))
+        check("...and preserves the changed render for inspection or retry",
+              open(changing_render, "rb").read(), b"late non-image replacement")
+        # slug validation and containment, on the placement path too
+        render = touch(os.path.join(tmp, "render2.gif"), gif)
+        check("place refuses a slug that is a path",
+              place_file(render, att, "../escape", 23)["ok"], False)
+        check("place refuses an empty slug",
+              place_file(render, att, "  ", 23)["ok"], False)
+        check("...and the render is still there, not consumed by a refusal",
+              os.path.exists(render), True)
+        # CONVENTIONS §8b: nothing unfinished is ever written into the folder
+        inside = touch(os.path.join(att, "scratch.gif"), gif)
+        res = place_file(inside, att, "Teslo_Cancer_2026", 24)
+        check("place refuses a source inside the attachments folder",
+              (res["ok"], "inside the attachments folder" in (res["error"] or "")),
+              (False, True))
+        if os.path.exists(inside):       # a refusal leaves it where it was
+            os.remove(inside)
+
+        case_alias_source = touch(os.path.join(att, "case-alias-scratch.gif"), gif)
+        real_realpath = os.path.realpath
+
+        def case_preserving_realpath(path):
+            resolved = real_realpath(path)
+            if os.path.abspath(path) == case_alias_source:
+                # Model the default-APFS behavior behind the regression:
+                # identity is shared, but realpath preserves a different path
+                # spelling than the one used for --attachments.
+                return os.path.join(os.path.dirname(resolved).swapcase(),
+                                    os.path.basename(resolved))
+            return resolved
+
+        with patch.object(os.path, "realpath", side_effect=case_preserving_realpath):
+            case_alias_result = place_file(
+                case_alias_source, att, "Teslo_Cancer_2026", 24)
+        check("place compares ancestor identity rather than case-sensitive realpaths",
+              (case_alias_result["ok"], os.path.isfile(case_alias_source),
+               "inside the attachments folder" in
+               (case_alias_result["error"] or "")),
+              (False, True, True))
+        os.remove(case_alias_source)
+
+        res = download_one("file:///etc/passwd", att, "Teslo_Cancer_2026", 8)
+        check("download_one refuses a file: URL", res["ok"], False)
+        res = download_one(data_url, att, "../escape", 9)
+        check("download_one refuses a slug that is a path", res["ok"], False)
+        res = download_one(data_url, att, "Teslo_Cancer_2026", 0)
+        check("download_one refuses figure zero and writes no slot",
+              (res["ok"], _glob_slug(att, "Teslo_Cancer_2026", "_fig_0.*")),
+              (False, []))
+        zero_render = touch(os.path.join(tmp, "zero-index.gif"), gif)
+        res = place_file(zero_render, att, "Teslo_Cancer_2026", 0)
+        check("place refuses figure zero without consuming the render",
+              (res["ok"], os.path.exists(zero_render)), (False, True))
+        check("no failed download leaves its temp file behind",
+              strays() - before, set())
+
+        # --- handoff planning ----------------------------------------------------
+        def figures(slug, names=("_fig_1.png", "_fig_2.png", "_fig_3.png")):
+            # a fresh folder per fixture: a shared one carries the previous
+            # case's renames into the next one's assertions
+            folder = tempfile.mkdtemp(prefix="rename.", dir=tmp)
+            for n in names:
+                touch(os.path.join(folder, slug + n), _PNG)
+            return folder
+
+        missing_guard = figures("Needs_Ownership_2025", ("_fig_1.png",))
+        raises("rename refuses to run without the recursive PDF ownership inventory",
+               _plan_slug_rename, missing_guard, "Needs_Ownership_2025", "New_Slug_2026")
+        raises("rename also requires the exact clipping owner note",
+               _plan_slug_rename, missing_guard, "Needs_Ownership_2025", "New_Slug_2026",
+               sources=sources)
+
+        def canonical_rename_fixture(label, old_slug, names=("_fig_1.png",)):
+            vault = tempfile.mkdtemp(prefix="dependency-%s." % label, dir=tmp)
+            image_dir = os.path.join(vault, "Sources", "Images")
+            pdf_dir = os.path.join(vault, "Sources", "PDFs")
+            note_dir = os.path.join(vault, "Articles")
+            os.makedirs(image_dir)
+            os.makedirs(pdf_dir)
+            os.makedirs(note_dir)
+            embeds = []
+            for tail in names:
+                name = old_slug + tail
+                touch(os.path.join(image_dir, name), _PNG)
+                embeds.append(name)
+            owner_path = os.path.join(note_dir, old_slug + ".md")
+            with open(owner_path, "w", encoding="utf-8") as fh:
+                fh.write("---\nsources:\n  - https://example.com/%s\n---\n" % label)
+                for name in embeds:
+                    fh.write("![[%s]]\n" % name)
+            return vault, image_dir, pdf_dir, owner_path, embeds
+
+        # A logical vault may symlink its whole Sources/ directory to storage
+        # outside the vault. Owner binding must use the logical Articles/
+        # identity in that layout, while an alias between two complete vaults
+        # remains ambiguous and cannot borrow ownership evidence.
+        linked_vault = tempfile.mkdtemp(prefix="linked-sources-vault.", dir=tmp)
+        linked_store = tempfile.mkdtemp(prefix="linked-sources-store.", dir=tmp)
+        linked_articles = os.path.join(linked_vault, "Articles")
+        linked_sources = os.path.join(linked_store, "Sources")
+        os.makedirs(linked_articles)
+        os.makedirs(os.path.join(linked_sources, "Images"))
+        os.makedirs(os.path.join(linked_sources, "PDFs"))
+        os.symlink(linked_sources, os.path.join(linked_vault, "Sources"),
+                   target_is_directory=True)
+        linked_slug = "Linked_Clipping_2025"
+        linked_image = linked_slug + "_fig_1.png"
+        touch(os.path.join(linked_vault, "Sources", "Images", linked_image),
+              _PNG)
+        linked_owner = os.path.join(linked_articles, linked_slug + ".md")
+        with open(linked_owner, "w", encoding="utf-8") as fh:
+            fh.write("---\nsources:\n  - https://example.com/linked\n---\n"
+                     "![[%s]]\n" % linked_image)
+        bound = _load_clipping_owner(
+            linked_owner, linked_slug,
+            os.path.join(linked_vault, "Sources", "Images"))
+        check("a symlinked Sources directory binds to the logical vault owner",
+              bound["vault"], os.path.realpath(linked_vault))
+
+        source_vault = tempfile.mkdtemp(prefix="source-complete-vault.", dir=tmp)
+        os.makedirs(os.path.join(source_vault, "Articles"))
+        os.makedirs(os.path.join(source_vault, "Sources", "Images"))
+        alias_vault = tempfile.mkdtemp(prefix="aliased-complete-vault.", dir=tmp)
+        os.makedirs(os.path.join(alias_vault, "Articles"))
+        os.symlink(os.path.join(source_vault, "Sources"),
+                   os.path.join(alias_vault, "Sources"),
+                   target_is_directory=True)
+        alias_owner = os.path.join(
+            alias_vault, "Articles", linked_slug + ".md")
+        with open(alias_owner, "w", encoding="utf-8") as fh:
+            fh.write("---\nsources:\n  - https://example.com/alias\n---\n"
+                     "![[%s]]\n" % linked_image)
+        raises("an alias between two complete vaults cannot borrow owner evidence",
+               _load_clipping_owner, alias_owner, linked_slug,
+               os.path.join(alias_vault, "Sources", "Images"))
+
+        dep_vault, dep_images, dep_pdfs, dep_owner, dep_names = \
+            canonical_rename_fixture("external", "Old_Dependency_2025")
+        dep_wiki = os.path.join(dep_vault, "Wiki")
+        os.makedirs(dep_wiki)
+        dep_reference = os.path.join(dep_wiki, "reference.md")
+        with open(dep_reference, "w", encoding="utf-8") as fh:
+            fh.write("[[Old_Dependency_2025|old note]]\n"
+                     "![[Sources/Images/Old_Dependency_2025_fig_1.png]]\n")
+        dependency_report = dependency_status(
+            dep_images, dep_owner, "Old_Dependency_2025")
+        check("dependency re-probe names every external blocker path and target",
+              (dependency_report["ok"], dependency_report["blockers"]),
+              (False, [{"path": os.path.realpath(dep_reference),
+                        "references": ["Old_Dependency_2025.md",
+                                       "Old_Dependency_2025_fig_1.png"]}]))
+        old_image_bytes = open(os.path.join(dep_images, dep_names[0]), "rb").read()
+        with open(dep_reference, "w", encoding="utf-8") as fh:
+            fh.write('The opener is `<!--`.\n\n'
+                     '![[Old_Dependency_2025_fig_1.png]]\n\nThe closer is `-->`.\n')
+        literal_blocked = dependency_status(dep_images, dep_owner, "Old_Dependency_2025")
+        check("literal comment examples cannot certify a still-referenced image for retirement",
+              (literal_blocked["ok"], open(os.path.join(dep_images, dep_names[0]), "rb").read()),
+              (False, old_image_bytes))
+        with open(dep_reference, "w", encoding="utf-8") as fh:
+            fh.write("`[[Old_Dependency_2025]]`\n"
+                     "<!-- ![[Old_Dependency_2025_fig_1.png]] -->\n")
+        check("code and comments do not manufacture dependency blockers",
+              dependency_status(dep_images, dep_owner,
+                                "Old_Dependency_2025")["blockers"], [])
+        os.makedirs(os.path.join(dep_vault, ".stversions"))
+        touch(os.path.join(dep_vault, ".stversions", "reference.md"),
+              b"[[Old_Dependency_2025]]\n")
+        check("hidden folders such as sync archives are not dependency blockers",
+              dependency_status(dep_images, dep_owner,
+                                "Old_Dependency_2025")["blockers"], [])
+        os.makedirs(os.path.join(dep_vault, "Reviews"))
+        dep_log = os.path.join(dep_vault, "Reviews",
+                               "clipping-clean-suggestions.md")
+        log_text = ("- [ ] **CC-001** Summary drops a caveat\n"
+                    "  - Evidence: [[Articles/Old_Dependency_2025|the note]]; "
+                    "see `Articles/Old_Dependency_2025.md`.\n")
+        with open(dep_log, "w", encoding="utf-8") as fh:
+            fh.write(log_text)
+        check("a suggestion log's link to the old note is a named blocker",
+              dependency_status(dep_images, dep_owner,
+                                "Old_Dependency_2025")["blockers"],
+              [{"path": os.path.realpath(dep_log),
+                "references": ["Old_Dependency_2025.md"]}])
+        with open(dep_log, "w", encoding="utf-8") as fh:
+            fh.write(log_text.replace("[[Articles/Old_Dependency_2025|",
+                                      "[[Articles/New_Dependency_2026|"))
+        check("rewriting only the log's link target clears it; code stays inert",
+              dependency_status(dep_images, dep_owner,
+                                "Old_Dependency_2025")["blockers"], [])
+        os.remove(dep_log)
+        os.rmdir(dep_pdfs)
+        check("an absent canonical Sources/PDFs holds no PDFs, as in preflight",
+              [row["ok"] for row in _plan_slug_rename(
+                  dep_images, "Old_Dependency_2025", "New_Dependency_2026",
+                  sources=dep_pdfs, owner_note=dep_owner)], [True])
+
+        handoff_vault, handoff_images, handoff_pdfs, handoff_owner, handoff_names = \
+            canonical_rename_fixture("two-phase", "Old_Handoff_2025")
+        handoff_new_slug = "New_Handoff_2026"
+        handoff_new_owner = os.path.join(
+            handoff_vault, "Articles", handoff_new_slug + ".md")
+        with open(handoff_new_owner, "w", encoding="utf-8") as fh:
+            fh.write("---\nsources:\n  - https://example.com/two-phase\n---\n")
+            for name in handoff_names:
+                fh.write("![[%s]]\n" % name.replace(
+                    "Old_Handoff_2025", handoff_new_slug, 1))
+        handoff_wiki = os.path.join(handoff_vault, "Wiki")
+        os.makedirs(handoff_wiki)
+        handoff_reference = os.path.join(handoff_wiki, "reference.md")
+        with open(handoff_reference, "w", encoding="utf-8") as fh:
+            fh.write("[[Old_Handoff_2025|old note]]\n"
+                     "![[Old_Handoff_2025_fig_1.png]]\n")
+        prepared = prepare_slug_rename(
+            handoff_images, "Old_Handoff_2025", handoff_new_slug,
+            sources=handoff_pdfs, owner_note=handoff_owner,
+            new_owner_note=handoff_new_owner)
+        handoff_old_image = os.path.join(handoff_images, handoff_names[0])
+        handoff_new_image = os.path.join(
+            handoff_images, handoff_names[0].replace(
+                "Old_Handoff_2025", handoff_new_slug, 1))
+        check("prepare publishes an exact new image while old dependencies resolve",
+              (prepared["ok"], prepared["dependency"]["ok"],
+               os.path.isfile(handoff_old_image),
+               os.path.isfile(handoff_new_image),
+               open(handoff_old_image, "rb").read(),
+               open(handoff_new_image, "rb").read()),
+              (True, False, True, True, _PNG, _PNG))
+        try:
+            finalize_slug_rename(
+                handoff_images, "Old_Handoff_2025", handoff_new_slug,
+                sources=handoff_pdfs, owner_note=handoff_owner,
+                new_owner_note=handoff_new_owner)
+            premature_finalize = False
+        except ValueError:
+            premature_finalize = True
+        check("finalize refuses while an old-note or old-image dependency remains",
+              (premature_finalize, os.path.isfile(handoff_old_image),
+               os.path.isfile(handoff_new_image)), (True, True, True))
+        with open(handoff_reference, "w", encoding="utf-8") as fh:
+            fh.write("[[New_Handoff_2026|new note]]\n"
+                     "![[New_Handoff_2026_fig_1.png]]\n")
+        real_remove_expected = remove_expected
+
+        def refuse_before_retirement(*_args, **_kwargs):
+            raise PublicationConflict("injected pre-displacement conflict")
+
+        with patch.dict(globals(), remove_expected=refuse_before_retirement):
+            try:
+                finalize_slug_rename(
+                    handoff_images, "Old_Handoff_2025", handoff_new_slug,
+                    sources=handoff_pdfs, owner_note=handoff_owner,
+                    new_owner_note=handoff_new_owner)
+                pre_displacement_error = ""
+            except PublicationConflict as exc:
+                pre_displacement_error = str(exc)
+        check("a pre-displacement finalize conflict is not a false mixed rollback",
+              ("rollback was incomplete" in pre_displacement_error,
+               os.path.isfile(handoff_old_image),
+               os.path.isfile(handoff_new_image)), (False, True, True))
+
+        def refuse_after_restoration(target, _expected, _snapshot, stage_dir,
+                                     **_kwargs):
+            os.link(target, os.path.join(stage_dir, ".atomic-displaced"))
+            raise PublicationConflict("injected conflict after restoration")
+
+        with patch.dict(globals(), remove_expected=refuse_after_restoration):
+            try:
+                finalize_slug_rename(
+                    handoff_images, "Old_Handoff_2025", handoff_new_slug,
+                    sources=handoff_pdfs, owner_note=handoff_owner,
+                    new_owner_note=handoff_new_owner)
+                post_restoration_error = ""
+            except PublicationConflict as exc:
+                post_restoration_error = str(exc)
+        handoff_stage_parent = os.path.dirname(os.path.realpath(handoff_images))
+        check("a finalize conflict after atomic restoration cleans private state",
+              ("rollback was incomplete" in post_restoration_error,
+               os.path.isfile(handoff_old_image),
+               os.path.isfile(handoff_new_image),
+               [name for name in os.listdir(handoff_stage_parent)
+                if name.startswith(".clipping-handoff-retire-")]),
+              (False, True, True, []))
+        globals()["remove_expected"] = real_remove_expected
+        finalized = finalize_slug_rename(
+            handoff_images, "Old_Handoff_2025", handoff_new_slug,
+            sources=handoff_pdfs, owner_note=handoff_owner,
+            new_owner_note=handoff_new_owner)
+        check("finalize retires only the exact old copy after a clean re-probe",
+              (finalized["ok"], finalized["retired"],
+               os.path.lexists(handoff_old_image),
+               open(handoff_new_image, "rb").read()),
+              (True, 1, False, _PNG))
+
+        # These races exercise the supported two-owner handoff rather than a
+        # standalone move. Preparation must retain every old image; failed
+        # retirement must restore it without replacing a newer occupant.
+        def handoff_case(label, names=("_fig_1.png", "_fig_2.png"),
+                         old_slug="Old_Test_2025"):
+            vault, images, pdfs, owner, old_names = canonical_rename_fixture(
+                label, old_slug, names)
+            new_owner = os.path.join(vault, "Articles", "New_Test_2026.md")
+            new_names = [name.replace(old_slug, "New_Test_2026", 1)
+                         for name in old_names]
+            with open(new_owner, "w", encoding="utf-8") as fh:
+                fh.write("---\nsources:\n  - https://example.com/%s\n---\n" % label)
+                fh.write("".join("![[%s]]\n" % name for name in new_names))
+            args = {"attachments": images, "old_slug": old_slug,
+                    "new_slug": "New_Test_2026", "sources": pdfs,
+                    "owner_note": owner, "new_owner_note": new_owner}
+            return (vault, args, [os.path.join(images, name) for name in old_names],
+                    [os.path.join(images, name) for name in new_names])
+
+        def failure(call):
+            try:
+                call()
+            except (OSError, ValueError) as exc:
+                return str(exc)
+            return ""
+
+        def current_bytes(paths):
+            return [open(path, "rb").read() if os.path.isfile(path) else None
+                    for path in paths]
+
+        # A text-only vault has no Sources/: an image-less handoff copies
+        # nothing, so the live prepare needs no stage there.
+        bare = tempfile.mkdtemp(prefix="bare-handoff.", dir=tmp)
+        os.makedirs(os.path.join(bare, "Articles"))
+        for slug in ("Old_Text_2025", "New_Text_2026"):
+            touch(os.path.join(bare, "Articles", slug + ".md"),
+                  b"---\nsources:\n  - https://example.com/text\n---\nBody.\n")
+        bare_prepared = prepare_slug_rename(
+            os.path.join(bare, "Sources", "Images"), "Old_Text_2025",
+            "New_Text_2026", sources=os.path.join(bare, "Sources", "PDFs"),
+            owner_note=os.path.join(bare, "Articles", "Old_Text_2025.md"),
+            new_owner_note=os.path.join(bare, "Articles", "New_Text_2026.md"))
+        check("prepare of an image-less note needs no Sources/ folder",
+              (bare_prepared["ok"], bare_prepared["prepared"],
+               os.path.lexists(os.path.join(bare, "Sources"))), (True, 0, False))
+
+        # Neither rename phase may move a legacy wiki-add research extract's
+        # images, whichever side of the handoff carries the marker.
+        for side in ("owner_note", "new_owner_note"):
+            _vault, extract_args, extract_old, extract_new_paths = handoff_case(
+                "extract-" + side)
+            with open(extract_args[side], encoding="utf-8") as fh:
+                marked = fh.read().replace(
+                    "---\n![[", "---\n<!-- obsidian:wiki-add-research-source -->\n"
+                    "Research extract\n![[", 1)
+            with open(extract_args[side], "w", encoding="utf-8") as fh:
+                fh.write(marked)
+            error = failure(lambda: prepare_slug_rename(**extract_args))
+            check("prepare refuses a research extract as the %s" % side,
+                  ("research extract" in error, current_bytes(extract_old),
+                   [os.path.lexists(path) for path in extract_new_paths]),
+                  (True, [_PNG, _PNG], [False, False]))
+
+        # The two-owner identity guards. Each refusal is pinned by its own
+        # message: without it, a later check would refuse for another reason.
+        _vault, guard_args, _old_paths, guard_new = handoff_case("other-origin")
+        clipping = open(guard_args["new_owner_note"], encoding="utf-8").read()
+        with open(guard_args["new_owner_note"], "w", encoding="utf-8") as fh:
+            fh.write(clipping.replace("/other-origin", "/another-article"))
+        error = failure(lambda: prepare_slug_rename(**guard_args))
+        check("prepare refuses owner notes from different web origins",
+              ("same normalized web origin" in error,
+               [os.path.lexists(path) for path in guard_new]), (True, [False, False]))
+        _vault, guard_args, _old_paths, guard_new = handoff_case("old-in-new")
+        with open(guard_args["new_owner_note"], "a", encoding="utf-8") as fh:
+            fh.write("![[Old_Test_2025_fig_1.png]]\n")
+        check("prepare refuses a new owner that still embeds an old image",
+              "still embeds old image" in failure(
+                  lambda: prepare_slug_rename(**guard_args)), True)
+        check("a handoff needs two distinct slug spellings",
+              "two distinct slug spellings" in failure(
+                  lambda: prepare_slug_rename(**dict(
+                      guard_args, new_slug=guard_args["old_slug"],
+                      new_owner_note=guard_args["owner_note"]))), True)
+        _vault, guard_args, _old_paths, guard_new = handoff_case("one-owner")
+        os.remove(guard_args["new_owner_note"])
+        os.link(guard_args["owner_note"], guard_args["new_owner_note"])
+        check("old and new owner paths cannot be one note",
+              "resolve to the same file" in failure(
+                  lambda: prepare_slug_rename(**guard_args)), True)
+        # A linked new name is itself an old-stem figure to the loose glob, so
+        # it reaches the mapping only when the old note also embeds it.
+        _vault, guard_args, guard_old, guard_new = handoff_case("one-image")
+        os.link(guard_old[0], guard_new[0])
+        with open(guard_args["owner_note"], "a", encoding="utf-8") as fh:
+            fh.write("![[%s]]\n" % os.path.basename(guard_new[0]))
+        check("an old and new image name that are one file are not handed off",
+              ("resolve to the same file" in failure(
+                  lambda: prepare_slug_rename(**guard_args)),
+               os.path.lexists(guard_new[1])), (True, False))
+        guard_vault, guard_args, guard_old, guard_new = handoff_case("dry-blocker")
+        prepare_slug_rename(**guard_args)
+        touch(os.path.join(guard_vault, "reference.md"), b"[[Old_Test_2025]]\n")
+        check("finalize --dry-run refuses while a dependency remains",
+              ("dependencies block" in failure(lambda: finalize_slug_rename(
+                  **guard_args, dry_run=True)), current_bytes(guard_old)),
+              (True, [_PNG, _PNG]))
+
+        # Two portable spellings of Articles/<slug>.md cannot both exist on
+        # every filesystem (macOS folds them), so present them to the guard.
+        _vault, guard_images, _pdfs, guard_owner, _names = \
+            canonical_rename_fixture("twin-owner", "Twin_Owner_2025")
+        real_scandir = os.scandir
+
+        class _Entries(list):
+            def __enter__(self):
+                return iter(self)
+
+            def __exit__(self, *_exc):
+                return False
+
+        def twin_owner_scandir(path=".", *args, **kwargs):
+            # rmtree scans by descriptor; only the owner's folder is doubled.
+            if (isinstance(path, int) or os.path.abspath(path)
+                    != os.path.dirname(os.path.abspath(guard_owner))):
+                return real_scandir(path, *args, **kwargs)
+            with real_scandir(path) as entries:
+                listed = list(entries)
+            return _Entries(listed + [entry for entry in listed
+                                      if entry.name == "Twin_Owner_2025.md"])
+
+        with patch.object(os, "scandir", side_effect=twin_owner_scandir):
+            error = failure(lambda: _load_clipping_owner(
+                guard_owner, "Twin_Owner_2025", guard_images))
+        check("two portable occupants of the owner name make ownership ambiguous",
+              "2 portable name occupants" in error, True)
+
+        # The CLI's `place` requires the canonical vault, and then a render
+        # inside that vault is not scratch, even outside Sources/Images.
+        place_vault, place_images, _pdfs, place_owner, _names = \
+            canonical_rename_fixture("render-in-vault", "Place_Guard_2025")
+        with open(place_owner, "a", encoding="utf-8") as fh:
+            fh.write("![[Place_Guard_2025_fig_2.gif]]\n")
+        os.makedirs(os.path.join(place_vault, "Scratch"))
+        vault_render = touch(os.path.join(place_vault, "Scratch", "render.gif"), gif)
+        res = place_file(vault_render, place_images, "Place_Guard_2025", 2,
+                         owner_note=place_owner, require_vault=True)
+        check("place refuses a --from-file elsewhere inside the vault",
+              (res["ok"], "inside the vault" in (res["error"] or ""),
+               os.path.exists(vault_render),
+               os.path.lexists(os.path.join(place_images,
+                                            "Place_Guard_2025_fig_2.gif"))),
+              (False, True, True, False))
+
+        real_publish = publish_new
+        _vault, handoff_args, old_paths, new_paths = handoff_case("changed-owner")
+
+        def change_owner_after_copy(*args, **kwargs):
+            result = real_publish(*args, **kwargs)
+            with open(handoff_args["owner_note"], "a", encoding="utf-8") as fh:
+                fh.write("\nConcurrent owner edit.\n")
+            return result
+
+        with patch.dict(globals(), publish_new=change_owner_after_copy):
+            error = failure(lambda: prepare_slug_rename(**handoff_args))
+        check("an owner edit during prepare retracts only new copies and retains old images",
+              ("owner-note changed" in error, current_bytes(old_paths), current_bytes(new_paths),
+               "Concurrent owner edit." in open(handoff_args["owner_note"], encoding="utf-8").read()),
+              (True, [_PNG, _PNG], [None, None], True))
+
+        _vault, handoff_args, old_paths, new_paths = handoff_case("late-destination")
+
+        def claim_destination_before_copy(staged, target, *args, **kwargs):
+            touch(target, b"another writer's destination")
+            return real_publish(staged, target, *args, **kwargs)
+
+        with patch.dict(globals(), publish_new=claim_destination_before_copy):
+            error = failure(lambda: prepare_slug_rename(**handoff_args))
+        check("a destination claimed after prepare preflight remains untouched",
+              (bool(error), current_bytes(old_paths), current_bytes(new_paths)),
+              (True, [_PNG, _PNG], [b"another writer's destination", None]))
+
+        _vault, handoff_args, old_paths, new_paths = handoff_case("changed-source")
+
+        def change_source_after_staging(*args, **kwargs):
+            touch(old_paths[0], b"another writer's source")
+            return real_publish(*args, **kwargs)
+
+        with patch.dict(globals(), publish_new=change_source_after_staging):
+            error = failure(lambda: prepare_slug_rename(**handoff_args))
+        check("a source changed after staging prevents prepare and retains the newer source",
+              (bool(error), current_bytes(old_paths), current_bytes(new_paths)),
+              (True, [b"another writer's source", _PNG], [None, None]))
+
+        _vault, handoff_args, old_paths, new_paths = handoff_case("partial-prepare")
+
+        def fail_second_copy(staged, target, *args, **kwargs):
+            if target == new_paths[1]:
+                raise OSError(28, "injected second-copy failure")
+            return real_publish(staged, target, *args, **kwargs)
+
+        with patch.dict(globals(), publish_new=fail_second_copy):
+            error = failure(lambda: prepare_slug_rename(**handoff_args))
+        check("partial prepare rolls back new copies while retaining the complete old set",
+              ("second-copy failure" in error, current_bytes(old_paths), current_bytes(new_paths)),
+              (True, [_PNG, _PNG], [None, None]))
+
+        race_vault, handoff_args, old_paths, new_paths = handoff_case("late-dependency")
+        prepare_slug_rename(**handoff_args)
+        real_remove = remove_expected
+
+        def reference_after_retirement(target, *args, **kwargs):
+            result = real_remove(target, *args, **kwargs)
+            with open(os.path.join(race_vault, "reference.md"), "w", encoding="utf-8") as fh:
+                fh.write("[[Old_Test_2025]]\n")
+            return result
+
+        with patch.dict(globals(), remove_expected=reference_after_retirement):
+            error = failure(lambda: finalize_slug_rename(**handoff_args))
+        check("a dependency arriving during finalize restores old images and preserves new copies",
+              ("dependencies block" in error, current_bytes(old_paths), current_bytes(new_paths)),
+              (True, [_PNG, _PNG], [_PNG, _PNG]))
+
+        _vault, handoff_args, old_paths, new_paths = handoff_case("partial-finalize")
+        prepare_slug_rename(**handoff_args)
+
+        def fail_second_retirement(target, *args, **kwargs):
+            if target == old_paths[1]:
+                raise OSError(28, "injected second-retirement failure")
+            return real_remove(target, *args, **kwargs)
+
+        with patch.dict(globals(), remove_expected=fail_second_retirement):
+            error = failure(lambda: finalize_slug_rename(**handoff_args))
+        check("partial finalize restores the complete old set and retains all verified copies",
+              ("second-retirement failure" in error, current_bytes(old_paths), current_bytes(new_paths)),
+              (True, [_PNG, _PNG], [_PNG, _PNG]))
+
+        _vault, handoff_args, old_paths, new_paths = handoff_case("reoccupied-old")
+        prepare_slug_rename(**handoff_args)
+
+        def reoccupy_retired_path(target, *args, **kwargs):
+            real_remove(target, *args, **kwargs)
+            touch(target, b"another writer's old-path occupant")
+            raise OSError("injected failure after old-path reoccupation")
+
+        with patch.dict(globals(), remove_expected=reoccupy_retired_path):
+            error = failure(lambda: finalize_slug_rename(**handoff_args))
+        retained = list(Path(handoff_args["attachments"]).parent.glob(
+            ".clipping-handoff-retire-*/.atomic-displaced"))
+        check("finalize rollback preserves a reoccupied old path and names retained recovery",
+              ("rollback was incomplete" in error, current_bytes(old_paths), current_bytes(new_paths),
+               [_path.read_bytes() for _path in retained]),
+              (True, [b"another writer's old-path occupant", _PNG], [_PNG, _PNG], [_PNG]))
+
+        # A same-note re-stem: the note was renamed but its images kept the
+        # old stem, and no old note remains to hand them off from.
+        def restem_case(label, names=("_fig_1.png", "_fig_2.png")):
+            vault, images, pdfs, old_note, old_names = canonical_rename_fixture(
+                label, "Old_Stem_2025", names)
+            owner = os.path.join(vault, "Articles", "New_Stem_2026.md")
+            os.rename(old_note, owner)
+            new_names = [name.replace("Old_Stem_2025", "New_Stem_2026", 1)
+                         for name in old_names]
+            args = {"attachments": images, "old_slug": "Old_Stem_2025",
+                    "new_slug": "New_Stem_2026", "sources": pdfs,
+                    "owner_note": owner, "new_owner_note": owner}
+            return (vault, args, [os.path.join(images, name) for name in old_names],
+                    [os.path.join(images, name) for name in new_names])
+
+        def republish(args, extra=""):
+            with open(args["owner_note"], encoding="utf-8") as fh:
+                text = fh.read().replace("Old_Stem_2025", "New_Stem_2026")
+            with open(args["owner_note"], "w", encoding="utf-8") as fh:
+                fh.write(text + extra)
+
+        restem_old_names = ["Old_Stem_2025_fig_1.png", "Old_Stem_2025_fig_2.png"]
+        _vault, restem_args, restem_old, restem_new = restem_case("restem")
+        planned = prepare_slug_rename(**restem_args, dry_run=True)
+        check("re-stem prepare --dry-run maps the note's old-stem images without copying",
+              (planned["restem"], [item["to"] for item in planned["mapping"]],
+               [row["action"] for row in planned["results"]],
+               [os.path.lexists(path) for path in restem_new]),
+              (True, ["New_Stem_2026_fig_1.png", "New_Stem_2026_fig_2.png"],
+               ["would-copy", "would-copy"], [False, False]))
+        prepared = prepare_slug_rename(**restem_args)
+        check("re-stem prepare copies exact bytes, keeps old names and lists the "
+              "note's own old references apart from blockers",
+              (prepared["prepared"], current_bytes(restem_old),
+               current_bytes(restem_new), prepared["dependency"]["blockers"],
+               prepared["dependency"]["owner_references"]),
+              (2, [_PNG, _PNG], [_PNG, _PNG], [], restem_old_names))
+        check("re-stem finalize refuses until the note's embeds are republished",
+              ("still embeds old image" in failure(
+                  lambda: finalize_slug_rename(**restem_args)),
+               current_bytes(restem_old)), (True, [_PNG, _PNG]))
+        republish(restem_args)
+        probe_stdout = io.StringIO()
+        with patch.object(sys, "stdout", probe_stdout):
+            probe_code = main([
+                "dependencies", "--attachments", restem_args["attachments"],
+                "--owner-note", restem_args["owner_note"],
+                "--old-slug", "Old_Stem_2025", "--new-slug", "New_Stem_2026"])
+        probe_report = json.loads(probe_stdout.getvalue())
+        check("the re-stem dependency re-probe CLI is clean after republication",
+              (probe_code, probe_report["ok"], probe_report["images"]),
+              (0, True, restem_old_names))
+        finalized = finalize_slug_rename(**restem_args)
+        check("re-stem finalize retires only the old copies of republished embeds",
+              (finalized["restem"], finalized["retired"],
+               [os.path.lexists(path) for path in restem_old],
+               current_bytes(restem_new)),
+              (True, 2, [False, False], [_PNG, _PNG]))
+
+        # Each refusal leaves every old image and creates no new one.
+        restem_vault, restem_args, restem_old, restem_new = restem_case("old-live")
+        touch(os.path.join(restem_vault, "Articles", "Old_Stem_2025.md"),
+              b"---\nsources:\n  - https://example.com/old-live\n---\n")
+        check("a re-stem is refused while Articles/<old-slug>.md exists",
+              ("still exists" in failure(
+                  lambda: prepare_slug_rename(**restem_args)),
+               [os.path.lexists(path) for path in restem_new]), (True, [False, False]))
+        _vault, restem_args, restem_old, restem_new = restem_case("unembedded")
+        touch(os.path.join(restem_args["attachments"], "Old_Stem_2025_fig_3.png"),
+              _PNG)
+        check("a re-stem is refused when an old-stem file is not the note's embed",
+              ("ownership is unproven" in failure(
+                  lambda: prepare_slug_rename(**restem_args)),
+               [os.path.lexists(path) for path in restem_new]), (True, [False, False]))
+        check("a re-stem owner must be Articles/<new-slug>.md",
+              "must be Articles/Other_Stem_2026.md" in failure(
+                  lambda: prepare_slug_rename(**dict(
+                      restem_args, new_slug="Other_Stem_2026"))), True)
+        check("a re-stem needs two distinct portable stems",
+              "two distinct portable stems" in failure(
+                  lambda: prepare_slug_rename(**dict(
+                      restem_args, old_slug="new_stem_2026"))), True)
+        _vault, restem_args, restem_old, restem_new = restem_case("restem-extract")
+        with open(restem_args["owner_note"], encoding="utf-8") as fh:
+            marked = fh.read().replace(
+                "---\n![[", "---\n<!-- obsidian:wiki-add-research-source -->\n"
+                "Research extract\n![[", 1)
+        with open(restem_args["owner_note"], "w", encoding="utf-8") as fh:
+            fh.write(marked)
+        check("a re-stem refuses a research extract",
+              ("research extract" in failure(
+                  lambda: prepare_slug_rename(**restem_args)),
+               [os.path.lexists(path) for path in restem_new]), (True, [False, False]))
+        _vault, restem_args, restem_old, restem_new = restem_case("restem-pdf")
+        touch(os.path.join(restem_args["sources"], "Old_Stem_2025.pdf"),
+              b"%PDF-1.7\n")
+        check("a re-stem refuses figures whose old stem is a PDF's",
+              ("belong to that document" in failure(
+                  lambda: prepare_slug_rename(**restem_args)),
+               [os.path.lexists(path) for path in restem_new]), (True, [False, False]))
+        _vault, restem_args, restem_old, restem_new = restem_case("new-embedded")
+        with open(restem_args["owner_note"], "a", encoding="utf-8") as fh:
+            fh.write("![[New_Stem_2026_fig_1.png]]\n")
+        check("re-stem prepare refuses a note already embedding a mapped new name",
+              ("already embeds" in failure(
+                  lambda: prepare_slug_rename(**restem_args)),
+               [os.path.lexists(path) for path in restem_new]), (True, [False, False]))
+        _vault, restem_args, restem_old, restem_new = restem_case("missing-old")
+        os.remove(restem_old[1])
+        check("a missing old-stem attachment blocks the whole re-stem",
+              ("exact attachment is missing" in failure(
+                  lambda: prepare_slug_rename(**restem_args)),
+               [os.path.lexists(path) for path in restem_new]), (True, [False, False]))
+        _vault, restem_args, restem_old, restem_new = restem_case("unprepared")
+        republish(restem_args)
+        check("re-stem finalize refuses a mapped name with no prepared copy",
+              ("no prepared copy" in failure(
+                  lambda: finalize_slug_rename(**restem_args)),
+               current_bytes(restem_old)), (True, [_PNG, _PNG]))
+
+        restem_vault, restem_args, restem_old, restem_new = restem_case("external")
+        os.makedirs(os.path.join(restem_vault, "Wiki"))
+        restem_wiki = touch(os.path.join(restem_vault, "Wiki", "entry.md"),
+                            b"[[Old_Stem_2025]] and ![[Old_Stem_2025_fig_1.png]]\n")
+        prepared = prepare_slug_rename(**restem_args)
+        check("re-stem blockers are other notes' old-image references, not "
+              "links to the absent old note",
+              prepared["dependency"]["blockers"],
+              [{"path": os.path.realpath(restem_wiki),
+                "references": ["Old_Stem_2025_fig_1.png"]}])
+        republish(restem_args)
+        check("re-stem finalize refuses while another note references an old image",
+              ("dependencies block" in failure(
+                  lambda: finalize_slug_rename(**restem_args)),
+               current_bytes(restem_old)), (True, [_PNG, _PNG]))
+        touch(restem_wiki, b"[[Old_Stem_2025]] and ![[New_Stem_2026_fig_1.png]]\n")
+        republish(restem_args, "[full size](Old_Stem_2025_fig_2.png)\n")
+        check("re-stem finalize refuses while the note itself links an old image",
+              ("still references old image" in failure(
+                  lambda: finalize_slug_rename(**restem_args)),
+               current_bytes(restem_old)), (True, [_PNG, _PNG]))
+
+        # Every probe keeps the fixed mapping: an image already retired is no
+        # longer on disk, but a new reference to it still restores the set.
+        restem_vault, restem_args, restem_old, restem_new = restem_case("late-ref")
+        prepare_slug_rename(**restem_args)
+        republish(restem_args)
+
+        def reference_retired(target, *args, **kwargs):
+            result = real_remove(target, *args, **kwargs)
+            touch(os.path.join(restem_vault, "late.md"),
+                  ("![[%s]]\n" % os.path.basename(target)).encode("utf-8"))
+            return result
+
+        with patch.dict(globals(), remove_expected=reference_retired):
+            error = failure(lambda: finalize_slug_rename(**restem_args))
+        check("a reference to an already retired re-stem image restores the old set",
+              ("dependencies block" in error, current_bytes(restem_old),
+               current_bytes(restem_new)),
+              (True, [_PNG, _PNG], [_PNG, _PNG]))
+
+        # rename --phase repair rewrites, between prepare and finalize, only
+        # the parsed targets that name the old note or a mapped old image.
+        def write_note(vault, relative, data):
+            path = os.path.join(vault, *relative.split("/"))
+            os.makedirs(os.path.dirname(path), exist_ok=True)
+            return touch(path, data if isinstance(data, bytes)
+                         else data.encode("utf-8"))
+
+        def note_bytes(paths):
+            return {path: open(path, "rb").read() for path in paths}
+
+        def statuses(report):
+            return {os.path.basename(row["path"]): row["status"]
+                    for row in report["results"]}
+
+        old, new = "Old_Test_2025", "New_Test_2026"
+        repair_templates = {
+            "Wiki/alias.md": (
+                '---\ntitle: Entry\ncreated: 2026-01-01\nupdated: 2026-02-02\n'
+                'read: true\nsources:\n  - "[[{s}.md]]"\n---\n'
+                'See [[{s}#Methods|the clipping]].\n'),
+            "Wiki/flow.md": ('---\nsources: ["[[{s}.md]]", "https://example.org/a"]'
+                             '\n---\n![[{s}_fig_1.png]]\n*A caption.*\n'),
+            "Wiki/embed.md": "![[{s}_fig_1.png|300]]\n",
+            "Wiki/markdown.md": ('[note](../Articles/{s}.md#intro) and '
+                                 '![chart](Sources/Images/{s}_fig_1.png "Chart")\n'),
+            "Wiki/reference.md": "See [the note][ref].\n\n[ref]: {s}.md\n",
+            "Investments/html.md": ('<img src="Sources/Images/{s}_fig_1.png" '
+                                    'width="200">\n'),
+            "Wiki/nested.md": ('[Smith [2024]](../Articles/{s}.md) and '
+                               '[![fig](Sources/Images/{s}_fig_1.png)]'
+                               '(../Articles/{s}.md)\n'),
+            "Wiki/unquoted.md": ('<a href=../Articles/{s}.md>clip</a> '
+                                 '<img src=Sources/Images/{s}_fig_1.png>\n'),
+            "Wiki/code.md": ("`[[{o}]]` and\n```\n![[{o}_fig_1.png]]\n```\n"
+                             "then [[{s}]]\n"),
+            "Wiki/math.md": "$$\n[[{o}]]\n$$\nthen [[{s}]]\n",
+            "Wiki/prefix.md": ("[[{o}_Notes]] ![[{o}_fig_10.png]] [[{o}0]] {o} "
+                               "prose https://example.com/{o}_fig_1.png "
+                               "and [[{s}]]\n"),
+            "MOCs/moc.md": "- Top\n    - [[{s}|label]]\n",
+            "Reviews/log.md": ("﻿- [ ] x\r\n  - [[Articles/{s}|the note]]; "
+                               "`Articles/{o}.md`\r\n"),
+            "Inbox/capture.md": ('---\nsource: "https://example.com/{o}"\n---\n'
+                                 'See [[{s}]] and ![[{s}_fig_1.png]].\n'),
+        }
+        repair_vault, repair_args, repair_old, repair_new = handoff_case(
+            "repair", ("_fig_1.png",))
+        repaired_paths = {}
+        for relative, template in repair_templates.items():
+            repaired_paths[relative] = write_note(
+                repair_vault, relative, template.format(s=old, o=old))
+        os.chmod(repaired_paths["Wiki/alias.md"], 0o640)
+        elsewhere = write_note(repair_vault, "Wiki/elsewhere.md",
+                               "[[Elsewhere/%s]] and [[%s]]\n" % (old, old))
+        everything = list(repaired_paths.values()) + [elsewhere]
+        before = note_bytes(everything)
+        refused = failure(lambda: repair_slug_rename(**repair_args))
+        check("repair refuses until prepare has published the new names",
+              ("run prepare first" in refused, note_bytes(everything) == before,
+               current_bytes(repair_new)), (True, True, [None]))
+        prepare_slug_rename(**repair_args)
+        # Prepare refuses an incomplete scan; a note can still turn
+        # unreadable before repair runs.
+        unreadable = write_note(repair_vault, "Wiki/bad.md",
+                                b"[[Old_Test_2025]] \xff\n")
+        everything.append(unreadable)
+        before = note_bytes(everything)
+        planned = repair_slug_rename(**repair_args, dry_run=True)
+        check("repair --dry-run plans every dependent and writes nothing",
+              (planned["ok"], statuses(planned), note_bytes(everything) == before),
+              (False, dict({os.path.basename(path): "would-rewrite"
+                            for path in repaired_paths.values()},
+                           **{"elsewhere.md": "blocked", "bad.md": "blocked"}),
+               True))
+        cli_stdout = io.StringIO()
+        with patch.object(sys, "stdout", cli_stdout):
+            cli_code = main([
+                "rename", "--phase", "repair", "--dry-run",
+                "--attachments", repair_args["attachments"],
+                "--sources", repair_args["sources"],
+                "--owner-note", repair_args["owner_note"],
+                "--new-owner-note", repair_args["new_owner_note"],
+                "--old-slug", old, "--new-slug", new])
+        cli_report = json.loads(cli_stdout.getvalue())
+        check("the repair CLI reports the same plan and exits 1 while blockers remain",
+              (cli_code, cli_report["mode"], cli_report["phase"],
+               cli_report["results"] == planned["results"],
+               note_bytes(everything) == before), (1, "rename", "repair", True, True))
+        repaired = repair_slug_rename(**repair_args)
+
+        def repaired_as_expected(relative):
+            template = repair_templates[relative]
+            return (open(repaired_paths[relative], "rb").read()
+                    == template.format(s=new, o=old).encode("utf-8"))
+
+        check("repair keeps a wikilink's alias and heading, the YAML sources "
+              "form, every date and read:, and the file mode",
+              (repaired_as_expected("Wiki/alias.md"),
+               stat.S_IMODE(os.stat(repaired_paths["Wiki/alias.md"]).st_mode)),
+              (True, 0o640))
+        check("repair keeps a flow-list sources citation's .md extension",
+              repaired_as_expected("Wiki/flow.md"), True)
+        check("repair keeps an embed's size",
+              repaired_as_expected("Wiki/embed.md"), True)
+        check("repair keeps a Markdown link's relative path and anchor and an "
+              "image's folder and title",
+              repaired_as_expected("Wiki/markdown.md"), True)
+        check("repair rewrites a reference-style link definition",
+              repaired_as_expected("Wiki/reference.md"), True)
+        check("repair rewrites an HTML img src and keeps its attributes",
+              repaired_as_expected("Investments/html.md"), True)
+        check("repair rewrites a link with bracketed text and both targets "
+              "of a linked image",
+              repaired_as_expected("Wiki/nested.md"), True)
+        check("repair rewrites unquoted HTML href and src values",
+              repaired_as_expected("Wiki/unquoted.md"), True)
+        check("repair leaves a code span and a fence untouched",
+              repaired_as_expected("Wiki/code.md"), True)
+        check("repair leaves a display-math block untouched",
+              repaired_as_expected("Wiki/math.md"), True)
+        check("repair leaves names that only share a prefix, prose and URLs",
+              repaired_as_expected("Wiki/prefix.md"), True)
+        check("repair keeps nested MOC indentation, a BOM and CRLF line endings",
+              (repaired_as_expected("MOCs/moc.md"),
+               repaired_as_expected("Reviews/log.md")), (True, True))
+        check("repair respells an Inbox raw's links and keeps its URL",
+              repaired_as_expected("Inbox/capture.md"), True)
+        check("an ambiguous folder or unreadable note stays unchanged and blocked",
+              (repaired["ok"], repaired["rewritten"], repaired["blocked"],
+               statuses(repaired)["elsewhere.md"], statuses(repaired)["bad.md"],
+               open(elsewhere, "rb").read(), open(unreadable, "rb").read(),
+               current_bytes(repair_old)),
+              (False, 14, 2, "blocked", "blocked",
+               ("[[Elsewhere/%s]] and [[%s]]\n" % (old, old)).encode("utf-8"),
+               b"[[Old_Test_2025]] \xff\n", [_PNG]))
+        touch(elsewhere, ("[[Articles/%s]] and [[%s]]\n" % (old, old)).encode())
+        touch(unreadable, b"[[Old_Test_2025]]\n")
+        rerun = repair_slug_rename(**repair_args)
+        check("a rerun rewrites the resolved blockers and only them",
+              (rerun["ok"], statuses(rerun), open(elsewhere, "rb").read(),
+               open(unreadable, "rb").read()),
+              (True, {"elsewhere.md": "rewritten", "bad.md": "rewritten"},
+               ("[[Articles/%s]] and [[%s]]\n" % (new, new)).encode("utf-8"),
+               b"[[New_Test_2026]]\n"))
+        settled = note_bytes(everything)
+        again = repair_slug_rename(**repair_args)
+        check("repair is idempotent: a second run finds nothing to rewrite",
+              (again["ok"], again["results"], note_bytes(everything) == settled),
+              (True, [], True))
+        check("after repair the re-probe is clean and finalize retires the old copy",
+              (dependency_status(repair_args["attachments"],
+                                 repair_args["owner_note"], old)["ok"],
+               finalize_slug_rename(**repair_args)["retired"],
+               current_bytes(repair_old), current_bytes(repair_new)),
+              (True, 1, [None], [_PNG]))
+        # A run that stopped after finalize but before old-note removal: the
+        # old note still embeds the retired names. The refusal names that
+        # state instead of asking for a restore; the re-probe stays clean,
+        # and removing the old note against a fresh record finishes it. The
+        # swapped pair reads the same, so only publish-note's handoff record
+        # names the old note; without it, prepare asks for a restore.
+        unrecorded_error = failure(lambda: prepare_slug_rename(
+            **repair_args, dry_run=True))
+        handoff_json = touch(
+            os.path.join(repair_vault, "Articles", ".%s.handoff.json" % new),
+            json.dumps({"old_note": "Articles/%s.md" % old,
+                        "new_note": "Articles/%s.md" % new}).encode("utf-8"))
+        retired_error = failure(lambda: prepare_slug_rename(
+            **repair_args, dry_run=True))
+        check("after finalize, prepare names the retired old copy instead "
+              "of asking for a restore",
+              ("already retired" in retired_error,
+               "restore it or replace" in retired_error,
+               "already retired" in failure(lambda: finalize_slug_rename(
+                   **repair_args, dry_run=True)),
+               dependency_status(repair_args["attachments"],
+                                 repair_args["owner_note"], old)["ok"],
+               "already retired" in unrecorded_error,
+               "restore it or replace" in unrecorded_error),
+              (True, False, True, True, False, True))
+        swapped = dict(repair_args, old_slug=new, new_slug=old,
+                       owner_note=repair_args["new_owner_note"],
+                       new_owner_note=repair_args["owner_note"])
+        check("every phase refuses the swapped pair while the recorded old "
+              "note exists",
+              ["is the new note of a pending handoff from %s.md" % old
+               in failure(call) for call in (
+                   lambda: prepare_slug_rename(**swapped, dry_run=True),
+                   lambda: repair_slug_rename(**swapped, dry_run=True),
+                   lambda: finalize_slug_rename(**swapped, dry_run=True),
+                   lambda: dependency_status(
+                       swapped["attachments"], swapped["owner_note"], new))],
+              [True] * 4)
+        retired_snap = os.path.join(tmp, "retired-handoff-snap.json")
+        publish_files.cmd_snapshot(
+            repair_vault, ["Articles/%s.md" % old,
+                           "Articles/.%s.handoff.json" % new],
+            output=retired_snap)
+        removed, _code = publish_files.cmd_remove(
+            repair_vault, retired_snap,
+            ["Articles/%s.md" % old, "Articles/.%s.handoff.json" % new])
+        check("...and old-note removal finishes it and keeps the new images",
+              ([row["action"] for row in removed["results"]],
+               os.path.lexists(repair_args["owner_note"]),
+               os.path.lexists(handoff_json), current_bytes(repair_new)),
+              (["removed", "removed"], False, False, [_PNG]))
+        touch(handoff_json, json.dumps({
+            "old_note": "Articles/%s.md" % old,
+            "new_note": "Articles/%s.md" % new}).encode("utf-8"))
+        check("a record whose old note is gone blocks no later handoff",
+              failure(lambda: dependency_status(
+                  repair_args["attachments"], repair_args["new_owner_note"],
+                  new)), "")
+        # An old copy deleted by hand after prepare, while another note still
+        # links the old note, is not a finalized handoff. Every phase asks for
+        # a restore from the mapped new copy, and placing a scratch copy of it
+        # lets the handoff continue.
+        gone_vault, gone_args, gone_old, gone_new = handoff_case(
+            "deleted-after-prepare", ("_fig_1.png",))
+        write_note(gone_vault, "Wiki/dep.md", "See [[%s]].\n" % old)
+        # `place` restores at 0644; a prepared copy matches by content alone.
+        os.chmod(gone_old[0], 0o600)
+        prepare_slug_rename(**gone_args)
+        os.remove(gone_old[0])
+        gone_errors = [
+            failure(lambda: prepare_slug_rename(**gone_args, dry_run=True)),
+            failure(lambda: repair_slug_rename(**gone_args))]
+        gone_copy = os.path.join(tempfile.mkdtemp(dir=tmp), "copy.png")
+        shutil.copyfile(gone_new[0], gone_copy)
+        restored = place_file(gone_copy, gone_args["attachments"], old, 1,
+                              owner_note=gone_args["owner_note"],
+                              require_vault=True)
+        check("an old copy deleted after prepare asks for a restore from its "
+              "new copy, and placing a scratch copy lets repair run",
+              ([("already retired" in error, "restore it or replace" in error,
+                 "%s holds the bytes prepare copied" % os.path.basename(
+                     gone_new[0]) in error) for error in gone_errors],
+               restored["ok"], current_bytes(gone_old),
+               [row["action"] for row in
+                prepare_slug_rename(**gone_args)["results"]],
+               repair_slug_rename(**gone_args)["ok"]),
+              ([(False, True, True)] * 2, True, [_PNG], ["already-prepared"],
+               True))
+
+        late_vault, late_args, _late_old, _late_new = handoff_case(
+            "repair-late", ("_fig_1.png",))
+        late_note = write_note(late_vault, "Wiki/late.md", "[[%s]]\n" % old)
+        prepare_slug_rename(**late_args)
+
+        def edit_before_replacement(staged, target, *args, **kwargs):
+            with open(target, "ab") as fh:
+                fh.write(b"a later edit\n")
+            return real_replace(staged, target, *args, **kwargs)
+
+        real_replace = replace_expected
+        with patch.dict(globals(), replace_expected=edit_before_replacement):
+            late = repair_slug_rename(**late_args)
+        check("a note changed after its snapshot is preserved and reported",
+              (late["ok"], statuses(late), open(late_note, "rb").read(),
+               "changed after planning" in late["results"][0].get("reason", ""),
+               [name for name in os.listdir(late_vault)
+                if name.startswith(".clipping-link-repair")]),
+              (False, {"late.md": "blocked"},
+               ("[[%s]]\na later edit\n" % old).encode("utf-8"), True, []))
+        check("a rerun repairs the changed note and keeps the later edit",
+              (repair_slug_rename(**late_args)["ok"], open(late_note, "rb").read()),
+              (True, ("[[%s]]\na later edit\n" % new).encode("utf-8")))
+
+        bare_vault, bare_args, _bare_old, _bare_new = handoff_case(
+            "repair-bare", ("_fig_1.png",))
+        write_note(bare_vault, "Wiki/%s.md" % old, "An unrelated namesake.\n")
+        ambiguous = {
+            "bare.md": ("[[%s]] and [[Articles/%s]]\n" % (old, old),
+                        "another vault file has this name or the new name"),
+            "masked.md": ("[[Articles/%s|a %%%%c%%%% label]]\n" % old,
+                          "masked text inside the target"),
+            "encoded.md": ("[[Articles/Old%5FTest%5F2025]]\n",
+                           "an encoded or irregular spelling"),
+        }
+        for name, (text, _reason) in ambiguous.items():
+            write_note(bare_vault, "Wiki/" + name, text)
+        prepare_slug_rename(**bare_args)
+        bare = repair_slug_rename(**bare_args)
+        check("a bare name shared by another note, masked text inside a target "
+              "or an encoded name blocks the whole note unchanged",
+              [(os.path.basename(row["path"]), row["status"],
+                ambiguous[os.path.basename(row["path"])][1]
+                in row.get("reason", ""),
+                open(row["path"], encoding="utf-8").read()
+                == ambiguous[os.path.basename(row["path"])][0])
+               for row in bare["results"]],
+              [(name, "blocked", True, True) for name in sorted(ambiguous)])
+
+        # A bare name is rewritten only while neither the old nor the new
+        # name has a namesake that Obsidian could resolve it to instead.
+        namesakes = {"new-note": ("Wiki/%s.md" % new, "Wiki/user.md",
+                                  "[[%s]] and [x](%s.md)\n" % (old, old)),
+                     "new-image": ("Other/%s_fig_1.png" % new, "Wiki/user.md",
+                                   "![[%s_fig_1.png]]\n" % old),
+                     "old-image": ("Other/%s_fig_1.png" % old, "Wiki/user.md",
+                                   "![[%s_fig_1.png]]\n" % old)}
+        namesake_results = {}
+        for label, (other, relative, text) in namesakes.items():
+            case_vault, case_args, _o, _n = handoff_case(
+                "repair-" + label, ("_fig_1.png",))
+            write_note(case_vault, other, b"x\n" if other.endswith(".md")
+                       else _PNG)
+            user = write_note(case_vault, relative, text)
+            qualified = write_note(
+                case_vault, "Wiki/qualified.md",
+                "[[Articles/%s]] ![](Sources/Images/%s_fig_1.png)\n" % (old, old))
+            prepare_slug_rename(**case_args)
+            report = repair_slug_rename(**case_args)
+            namesake_results[label] = (
+                statuses(report)["user.md"],
+                "another vault file has this name or the new name" in
+                "".join(row.get("reason", "") for row in report["results"]
+                        if row["path"].endswith("user.md")),
+                open(user, encoding="utf-8").read() == text,
+                open(qualified, encoding="utf-8").read())
+        check("a namesake of the new note or of an old or new image blocks a "
+              "bare reference unchanged; a folder-qualified one is rewritten",
+              namesake_results,
+              {label: ("blocked", True, True,
+                       "[[Articles/%s]] ![](Sources/Images/%s_fig_1.png)\n"
+                       % (new, new)) for label in namesakes})
+
+        # A dated stock- or market-research record is the investments
+        # plugin's immutable history, also through a linked-folder alias;
+        # other Investments/ notes and dated-looking names elsewhere are
+        # repaired.
+        dated_vault, dated_args, dated_old, dated_new = handoff_case(
+            "repair-dated", ("_fig_1.png",))
+        dated_text = ("---\nstock_research: 2\n---\nSee [[%s]] and "
+                      "![[%s_fig_1.png]]\n" % (old, old))
+        dated_notes = {
+            "2026-09-01-stock-research.md": write_note(
+                dated_vault, "Investments/2026-09-01-stock-research.md",
+                dated_text),
+            "2026-09-02-143000-market-research.md": write_note(
+                dated_vault,
+                "Investments/Research/2026-09-02-143000-market-research.md",
+                dated_text),
+        }
+        dated_free = {
+            "Research notes.md": write_note(
+                dated_vault, "Investments/Research notes.md",
+                "![[%s_fig_1.png]]\n" % old),
+            "2026-09-04-stock-research.md": write_note(
+                dated_vault, "Wiki/2026-09-04-stock-research.md",
+                "[[%s]]\n" % old),
+        }
+        prepare_slug_rename(**dated_args)
+        dated_before = note_bytes(dated_notes.values())
+        dated_plan = repair_slug_rename(**dated_args, dry_run=True)
+        dated_report = repair_slug_rename(**dated_args)
+        check("repair never edits a dated Investments/ research record, even "
+              "through a folder alias, and still repairs other notes",
+              (statuses(dated_plan), statuses(dated_report),
+               all("dated Investments/ research record is immutable"
+                   in row.get("reason", "") for row in dated_report["results"]
+                   if row["status"] == "blocked"),
+               note_bytes(dated_notes.values()) == dated_before,
+               {name: open(path, encoding="utf-8").read()
+                for name, path in dated_free.items()}),
+              (dict({name: "blocked" for name in dated_notes},
+                    **{name: "would-rewrite" for name in dated_free}),
+               dict({name: "blocked" for name in dated_notes},
+                    **{name: "rewritten" for name in dated_free}),
+               True, True,
+               {"Research notes.md": "![[%s_fig_1.png]]\n" % new,
+                "2026-09-04-stock-research.md": "[[%s]]\n" % new}))
+        check("a dated record's old reference keeps the re-probe failing and "
+              "finalize refusing, with both versions in place",
+              (dependency_status(dated_args["attachments"],
+                                 dated_args["owner_note"], old)["ok"],
+               "dependencies block" in failure(
+                   lambda: finalize_slug_rename(**dated_args)),
+               current_bytes(dated_old), current_bytes(dated_new)),
+              (False, True, [_PNG], [_PNG]))
+        alias_vault, alias_args, _o, _n = handoff_case(
+            "repair-dated-alias", ("_fig_1.png",))
+        alias_record = write_note(alias_vault,
+                                  "Data/2026-09-03-stock-research.md",
+                                  dated_text)
+        os.symlink("Data", os.path.join(alias_vault, "Investments"),
+                   target_is_directory=True)
+        prepare_slug_rename(**alias_args)
+        check("a dated record reached through an Investments/ folder alias "
+              "stays unchanged and blocked",
+              (statuses(repair_slug_rename(**alias_args)),
+               open(alias_record, encoding="utf-8").read()),
+              ({"2026-09-03-stock-research.md": "blocked"}, dated_text))
+
+        # A note behind a folder link to storage outside the vault is in the
+        # scan, so repair rewrites it; a leaf symlink to an outside file stays
+        # blocked and unchanged.
+        linked_vault, linked_args, linked_old, linked_new = handoff_case(
+            "repair-linked", ("_fig_1.png",))
+        linked_store = tempfile.mkdtemp(prefix="linked-notes.", dir=tmp)
+        linked_text = "[[%s]] and ![[%s_fig_1.png]]\n"
+        linked_note = touch(os.path.join(linked_store, "linked.md"),
+                            (linked_text % (old, old)).encode("utf-8"))
+        os.symlink(linked_store, os.path.join(linked_vault, "Linked"),
+                   target_is_directory=True)
+        leaf_target = touch(os.path.join(linked_store, "..",
+                                         "leaf-target.md"), b"[[%s]]\n" % (
+                                             old.encode("utf-8")))
+        leaf = os.path.join(linked_vault, "Wiki", "leaf.md")
+        os.makedirs(os.path.dirname(leaf))
+        os.symlink(leaf_target, leaf)
+        prepare_slug_rename(**linked_args)
+        linked_report = repair_slug_rename(**linked_args)
+        check("repair rewrites a note in a linked folder outside the vault "
+              "and keeps a leaf symlink blocked and unchanged",
+              (statuses(linked_report),
+               open(linked_note, encoding="utf-8").read(),
+               open(leaf_target, "rb").read()),
+              ({"linked.md": "rewritten", "leaf.md": "blocked"},
+               linked_text % (new, new), b"[[%s]]\n" % old.encode("utf-8")))
+        os.remove(leaf)
+        check("...and once the leaf is gone the re-probe is clean and "
+              "finalize retires the old copy",
+              (dependency_status(linked_args["attachments"],
+                                 linked_args["owner_note"], old)["ok"],
+               finalize_slug_rename(**linked_args)["retired"],
+               current_bytes(linked_old), current_bytes(linked_new)),
+              (True, 1, [None], [_PNG]))
+
+        # A slug may hold a dot. Its bare and piped wikilinks name the old
+        # note, and a rewrite adds no part of the old slug as an extension.
+        check("a bare name with a dot in it names the old note",
+              _dependency_classifier([], "Geron_ML_1.5_2024")(
+                  "Geron_ML_1.5_2024", True), "Geron_ML_1.5_2024.md")
+        dotted = "Old_Test_1.5_2025"
+        dotted_vault, dotted_args, dotted_old, dotted_new = handoff_case(
+            "repair-dotted", ("_fig_1.png",), old_slug=dotted)
+        dotted_templates = {
+            "Wiki/entry.md": ('---\nsources:\n  - "[[{s}.md]]"\n---\n'
+                              '![[{s}_fig_1.png]]\n*A caption.*\n'),
+            "Notes/links.md": ("[[{s}]], [[{s}|label]], [[{s}.md]] and "
+                               "[x]({s}.md)\n"),
+            "MOCs/moc.md": "- [[{s}]]\n",
+        }
+        dotted_paths = {relative: write_note(dotted_vault, relative,
+                                             template.format(s=dotted))
+                        for relative, template in dotted_templates.items()}
+        dotted_listed = sorted(
+            os.path.basename(row["path"]) for row in dependency_status(
+                dotted_args["attachments"], dotted_args["owner_note"],
+                dotted)["blockers"])
+        prepare_slug_rename(**dotted_args)
+        dotted_report = repair_slug_rename(**dotted_args)
+        check("a dotted old slug's bare, piped and .md links are listed and "
+              "rewritten without a stray extension, and finalize retires",
+              (dotted_listed, dotted_report["ok"],
+               {relative: open(path, encoding="utf-8").read()
+                for relative, path in dotted_paths.items()},
+               dependency_status(dotted_args["attachments"],
+                                 dotted_args["owner_note"], dotted)["ok"],
+               finalize_slug_rename(**dotted_args)["retired"],
+               current_bytes(dotted_old), current_bytes(dotted_new)),
+              (["entry.md", "links.md", "moc.md"], True,
+               {relative: template.format(s=new)
+                for relative, template in dotted_templates.items()},
+               True, 1, [None], [_PNG]))
+
+        # Repair reports, without blocking, each rewritten note link whose
+        # heading or block anchor the new note lacks.
+        anchor_vault, anchor_args, _o, _n = handoff_case(
+            "repair-anchor", ("_fig_1.png",))
+        with open(anchor_args["new_owner_note"], "a", encoding="utf-8") as fh:
+            fh.write("\n## Methods\n\nA kept passage. ^kept\n")
+        write_note(anchor_vault, "Notes/anchors.md",
+                   "[[{o}#^kept|a]] [[{o}#^gone|b]] [[{o}#Methods]] "
+                   "[[{o}#Results]] [x]({o}.md#%5Ekept) "
+                   "![[{o}_fig_1.png#crop]]\n".format(o=old))
+        write_note(anchor_vault, "Boards/anchors.canvas",
+                   '{"nodes":[{"type":"file","file":"Articles/%s.md",'
+                   '"subpath":"#^kept"},{"type":"file","subpath":"#^gone",'
+                   '"file":"Articles/%s.md"}]}\n' % (old, old))
+        prepare_slug_rename(**anchor_args)
+        anchor_report = repair_slug_rename(**anchor_args)
+        anchor_missing = {os.path.basename(row["path"]): row.get("missing_anchors")
+                          for row in anchor_report["results"]}
+        check("repair names each note link whose anchor the new note lacks",
+              (anchor_report["ok"], statuses(anchor_report),
+               anchor_missing["anchors.md"]),
+              (True, {"anchors.md": "rewritten", "anchors.canvas": "rewritten"},
+               [{"line": 1, "reference": "%s#^gone|b" % new},
+                {"line": 1, "reference": "%s#Results" % new}]))
+        check("repair names a Canvas file card whose subpath the new note lacks",
+              anchor_missing["anchors.canvas"],
+              [{"line": 1, "reference": "Articles/%s.md#^gone" % new}])
+
+        # A Canvas board's file card, group background and text card follow
+        # the rename, and every other byte of the board stays. A card in
+        # another folder, or a board that is not valid JSON but holds an old
+        # name, blocks untouched; a broken board or a non-UTF-8 note or board
+        # without one is no blocker.
+        canvas_vault, canvas_args, _o, _n = handoff_case(
+            "repair-canvas", ("_fig_1.png",))
+        canvas_template = (
+            '{{\n\t"nodes":[\n'
+            '\t\t{{"id":"a","type":"file","file":"Articles/{s}.md","x":0}},\n'
+            '\t\t{{"id":"b","type":"group","label":"{o}",'
+            '"background":"Sources/Images/{s}_fig_1.png"}},\n'
+            '\t\t{{"id":"c","type":"text","text":"See [[{s}|it]]\\n'
+            '![[{s}_fig_1.png|200]]"}},\n'
+            '\t\t{{"id":"d","type":"link","url":"https://example.org/{o}.md"}}'
+            '\n\t],\n\t"edges":[]\n}}\n')
+        canvas_board = write_note(canvas_vault, "Boards/map.canvas",
+                                  canvas_template.format(s=old, o=old))
+        canvas_other_text = ('{"nodes":[{"type":"file","file":"Notes/%s.md"}]}\n'
+                             % old)
+        canvas_other = write_note(canvas_vault, "Boards/other.canvas",
+                                  canvas_other_text)
+        write_note(canvas_vault, "Boards/unrelated.canvas", "{not json\n")
+        write_note(canvas_vault, "Wiki/legacy.md", b"Caf\xe9 notes\n")
+        write_note(canvas_vault, "Boards/legacy.canvas",
+                   b'{"nodes":[{"type":"text","text":"Caf\xe9"}]}\n')
+        prepare_slug_rename(**canvas_args)
+        canvas_broken_text = '{"nodes":[{"text":"[[%s]]"}\n' % old
+        canvas_broken = write_note(canvas_vault, "Boards/broken.canvas",
+                                   canvas_broken_text)
+        canvas_listed = {
+            os.path.basename(row["path"]): row.get("references", "error" in row)
+            for row in dependency_status(
+                canvas_args["attachments"], canvas_args["owner_note"],
+                old)["blockers"]}
+        canvas_report = repair_slug_rename(**canvas_args)
+        check("a Canvas board's file card, group background and text card "
+              "follow the rename; another folder's card and an unreadable "
+              "board citing the old name block, untouched",
+              (canvas_listed, statuses(canvas_report),
+               [len(row["references"]) for row in canvas_report["results"]
+                if row["path"].endswith("map.canvas")],
+               open(canvas_board, encoding="utf-8").read(),
+               open(canvas_other, encoding="utf-8").read(),
+               open(canvas_broken, encoding="utf-8").read()),
+              ({"map.canvas": [old + ".md", old + "_fig_1.png"],
+                "other.canvas": [old + ".md"], "broken.canvas": True},
+               {"map.canvas": "rewritten", "other.canvas": "blocked",
+                "broken.canvas": "blocked"}, [4],
+               canvas_template.format(s=new, o=old), canvas_other_text,
+               canvas_broken_text))
+        os.remove(canvas_other)
+        os.remove(canvas_broken)
+        check("after the board repair the re-probe is clean and finalize "
+              "retires the old copy",
+              (dependency_status(canvas_args["attachments"],
+                                 canvas_args["owner_note"], old)["ok"],
+               finalize_slug_rename(**canvas_args)["retired"]), (True, 1))
+
+        # When pdf-organize is missing or exits while loading, an unrelated
+        # board is no blocker and a board that may cite an old name blocks.
+        load_vault, load_images, _p, load_owner, _n = canonical_rename_fixture(
+            "canvas-load", old)
+        write_note(load_vault, "Boards/unrelated.canvas", '{"nodes":[]}\n')
+        load_exit = touch(os.path.join(tmp, "organize-exit.py"),
+                          b"raise SystemExit('bootstrap')\n")
+        loaded = sys.modules.pop("_knowledge_organize", None)
+        load_results = []
+        try:
+            for organize_py in (os.path.join(tmp, "absent", "organize.py"),
+                                load_exit):
+                with patch.dict(globals(), _ORGANIZE_PY=organize_py):
+                    clean = dependency_status(load_images, load_owner, old)
+                    citing = write_note(
+                        load_vault, "Boards/citing.canvas",
+                        '{"nodes":[{"type":"text","text":"![[%s_fig_1.png]]"}]}\n'
+                        % old)
+                    cited = dependency_status(load_images, load_owner, old)
+                    os.remove(citing)
+                load_results.append((
+                    clean["ok"],
+                    [(os.path.basename(row["path"]),
+                      row["error"].startswith("cannot parse this file"))
+                     for row in cited["blockers"]]))
+        finally:
+            sys.modules.pop("_knowledge_organize", None)
+            if loaded is not None:
+                sys.modules["_knowledge_organize"] = loaded
+        check("a pdf-organize that cannot load blocks only a board that may "
+              "cite an old name",
+              load_results, [(True, [("citing.canvas", True)])] * 2)
+
+        # An entry citing both notes of the same-URL pair keeps one citation:
+        # the rewritten block-list item goes and every other byte stays. Two
+        # items equal before the repair stay, and a flow list keeps both
+        # items and reports the copy. Lines are YAML's: U+2028 is content, a
+        # lone CR is a break.
+        twin_vault, twin_args, _o, _n = handoff_case(
+            "repair-twin", ("_fig_1.png",))
+        twin_templates = {
+            "Wiki/twin.md": ('---\ntitle: Entry\nsources:\n  - "[[{n}.md]]"\n'
+                             '  - "[[{o}.md]]"\n  - "https://example.org/a"\n'
+                             'read: true\n---\nSee [[{o}]].\n'),
+            "Wiki/same.md": ('---\nsources:\n  - "[[{o}.md]]"\n'
+                             '  - "[[{o}.md]]"\n---\nBody.\n'),
+            "Wiki/flow-twin.md": ('---\nsources: ["[[{o}.md]]", "[[{n}.md]]"]\n'
+                                  '---\nBody.\n'),
+            "Wiki/separator-twin.md": ('---\ntitle: "A\u2028B"\nsources:\n'
+                                       '  - \'[[{n}.md]]\'\n  - "[[{o}.md]]"\n'
+                                       'read: true\n---\nBody.\n'),
+            "Wiki/cr-twin.md": ('---\rsources:\r  - "[[{n}.md]]"\r'
+                                '  - "[[{o}.md]]"\r---\rBody.\r'),
+        }
+        twin_paths = {relative: write_note(twin_vault, relative,
+                                           template.format(o=old, n=new))
+                      for relative, template in twin_templates.items()}
+        prepare_slug_rename(**twin_args)
+        twin_plan = repair_slug_rename(**twin_args, dry_run=True)
+        twin_report = repair_slug_rename(**twin_args)
+
+        def twin_notes(report):
+            return {os.path.basename(row["path"]):
+                    (row.get("deduplicated"), row.get("duplicate_sources"))
+                    for row in report["results"]}
+
+        check("repair drops a sources: item it made a copy of another, keeps "
+              "an earlier copy and reports a flow-list copy",
+              (twin_report["ok"], statuses(twin_report), twin_notes(twin_report),
+               {relative: open(path, encoding="utf-8", newline="").read()
+                for relative, path in twin_paths.items()}),
+              (True, {"twin.md": "rewritten", "same.md": "rewritten",
+                      "flow-twin.md": "rewritten",
+                      "separator-twin.md": "rewritten",
+                      "cr-twin.md": "rewritten"},
+               {"twin.md": ([{"line": 5, "source": "[[%s.md]]" % new}], None),
+                "same.md": (None, None),
+                "flow-twin.md": (None, ["[[%s.md]]" % new]),
+                "separator-twin.md": (
+                    [{"line": 5, "source": "[[%s.md]]" % new}], None),
+                "cr-twin.md": ([{"line": 4, "source": "[[%s.md]]" % new}],
+                               None)},
+               {"Wiki/twin.md": ('---\ntitle: Entry\nsources:\n'
+                                 '  - "[[{n}.md]]"\n  - "https://example.org/a"\n'
+                                 'read: true\n---\nSee [[{n}]].\n').format(n=new),
+                "Wiki/same.md": twin_templates["Wiki/same.md"].format(o=new),
+                "Wiki/flow-twin.md":
+                    twin_templates["Wiki/flow-twin.md"].format(o=new, n=new),
+                "Wiki/separator-twin.md": (
+                    '---\ntitle: "A\u2028B"\nsources:\n  - \'[[{n}.md]]\'\n'
+                    'read: true\n---\nBody.\n').format(n=new),
+                "Wiki/cr-twin.md": ('---\rsources:\r  - "[[{n}.md]]"\r---\r'
+                                    'Body.\r').format(n=new)}))
+        check("the repair dry-run plans the same sources: copies",
+              twin_notes(twin_plan), twin_notes(twin_report))
+
+        # Repair parses a strict view: code behind container markers, an
+        # unclosed comment, HTML-like prose and YAML comments are not
+        # rewritten, though the fail-closed scanner reports them.
+        context_vault, context_args, _o, _n = handoff_case(
+            "repair-context", ("_fig_1.png",))
+        context_blocked = {
+            "callout-fence.md": ("> [!note]\n> ~~~md\n> ![[{o}_fig_1.png]]\n"
+                                 "> ~~~\n", "inside code, math or a comment"),
+            "list-quote-fence.md": ("- > ```\n  > ![[{o}_fig_1.png]]\n  > ```\n",
+                                    "inside code, math or a comment"),
+            "callout-math.md": ("> [!note]\n> $$\n> [[{o}]]\n> $$\n",
+                                "inside code, math or a comment"),
+            "unclosed-math.md": ("$$\n[[{o}]]\n",
+                                 "inside code, math or a comment"),
+            "inline-math.md": ("Math $a = \\text{{[[{o}]]}}$ here.\n",
+                               "inside code, math or a comment"),
+            "one-line-math.md": ("Shown $$x = \\text{{[[{o}]]}}$$ here.\n",
+                                 "inside code, math or a comment"),
+            "unclosed-percent.md": ("text %% open\n[[{o}]]\n",
+                                    "inside code, math or a comment"),
+            "unclosed-html.md": ("text <!-- open\n[[{o}]]\n",
+                                 "inside code, math or a comment"),
+            "prose-src.md": ('To embed, write src="{o}_fig_1.png" in the tag.\n',
+                             "not inside an HTML tag"),
+            "yaml-comment.md": ("---\n# comment [[{o}]]\ntitle: x\n---\nBody\n",
+                                "may be inside a YAML comment"),
+            "continued.md": ("Some text\n[e]: {o}.md\n",
+                             "may continue a paragraph"),
+        }
+        context_live = {
+            "quote-closed.md": ("> ```\n> code\n>> ```\n> ```\n"
+                                "> ![[{s}_fig_1.png]]\n"),
+            "quote-ended.md": "> ```\n> code\n\nafter [[{s}]]\n",
+            "nested-definitions.md": ("- [c]: {s}.md\n> [d]: {s}.md\n\n"
+                                      "- a\n\n    [f]: {s}.md\n"),
+            "currency.md": "Costs $5 and [[{s}]] for $6, then $x$.\n",
+        }
+        context_paths = {}
+        for name, (template, _reason) in context_blocked.items():
+            context_paths[name] = write_note(context_vault, "Wiki/" + name,
+                                             template.format(o=old))
+        for name, template in context_live.items():
+            context_paths[name] = write_note(
+                context_vault, "Wiki/" + name, template.format(s=old, o=old))
+        probe_report = dependency_status(context_args["attachments"],
+                                         context_args["owner_note"], old)
+        check("the scanner reports definitions inside list items and quotes",
+              sorted(os.path.basename(row["path"])
+                     for row in probe_report["blockers"]),
+              sorted(list(context_blocked) + list(context_live)))
+        check("a fence closed inside a list item hides nothing after it",
+              [_markdown_dependency_names(
+                  "- ```\n  code\n  ```\n" + link, [], old)
+               for link in ("[[%s]]\n" % old, "- [[%s]]\n" % old)],
+              [[old + ".md"], [old + ".md"]])
+        prepare_slug_rename(**context_args)
+        context = repair_slug_rename(**context_args)
+        reasons = {os.path.basename(row["path"]): row.get("reason", "")
+                   for row in context["results"]}
+        check("code or math behind container markers, unclosed, inline or "
+              "one-line math, unclosed comments, an attribute in prose, a "
+              "YAML comment and a paragraph's text block their notes unchanged",
+              {name: (statuses(context)[name], reason in reasons[name],
+                      open(context_paths[name], encoding="utf-8").read()
+                      == template.format(o=old))
+               for name, (template, reason) in context_blocked.items()},
+              {name: ("blocked", True, True) for name in context_blocked})
+        check("links after a closed or ended quoted fence, definitions in "
+              "containers and a link between two prices are rewritten",
+              {name: open(context_paths[name], encoding="utf-8").read()
+               for name in context_live},
+              {name: template.format(s=new, o=old)
+               for name, template in context_live.items()})
+        check("repair advice is offered only for blockers repair can rewrite",
+              ("rename --phase repair" in _dependency_error(
+                  [{"path": "a.md", "error": "cannot read"}]),
+               "make each named path readable" in _dependency_error(
+                  [{"path": "a.md", "error": "cannot read"}]),
+               "rename --phase repair" in _dependency_error(
+                  [{"path": "a.md", "error": "cannot read"},
+                   {"path": "b.md", "references": [old + ".md"]}])),
+              (False, True, True))
+        mixed_vault, mixed_args, _o, mixed_new = handoff_case(
+            "prepare-mixed-scan", ("_fig_1.png",))
+        write_note(mixed_vault, "Wiki/linker.md", "See [[%s]].\n" % old)
+        write_note(mixed_vault, "Boards/broken.canvas",
+                   '{"nodes":[{"text":"[[%s]]"}\n' % old)
+        refused = failure(lambda: prepare_slug_rename(**mixed_args))
+        check("an unreadable dependency beside an ordinary inbound link "
+              "refuses prepare with readable-path advice, not repair",
+              ("make each named path readable" in refused,
+               "rename --phase repair" in refused,
+               "broken.canvas" in refused, current_bytes(mixed_new)),
+              (True, False, True, [None]))
+
+        restem_vault, restem_args, restem_old, restem_new = restem_case(
+            "repair-restem")
+        restem_note = write_note(
+            restem_vault, "Wiki/entry.md",
+            "[[Old_Stem_2025]] and ![[Old_Stem_2025_fig_1.png|200]]\n")
+        prepare_slug_rename(**restem_args)
+        restem_repair = repair_slug_rename(**restem_args)
+        check("re-stem repair rewrites other notes' old image references only",
+              (restem_repair["ok"], restem_repair["restem"],
+               statuses(restem_repair), open(restem_note, "rb").read()),
+              (True, True, {"entry.md": "rewritten"},
+               b"[[Old_Stem_2025]] and ![[New_Stem_2026_fig_1.png|200]]\n"))
+        republish(restem_args)
+        check("re-stem repair after republication is clean and finalize retires",
+              (repair_slug_rename(**restem_args)["results"],
+               finalize_slug_rename(**restem_args)["retired"],
+               current_bytes(restem_old), current_bytes(restem_new)),
+              ([], 2, [None, None], [_PNG, _PNG]))
+
+        nfd_old = unicodedata.normalize("NFD", "Müller_Dependency_2025")
+        nfd_vault, nfd_images, nfd_pdfs, nfd_owner, nfd_names = \
+            canonical_rename_fixture("normalization", nfd_old)
+        nfd_ref = os.path.join(nfd_vault, "reference.md")
+        with open(nfd_ref, "w", encoding="utf-8") as fh:
+            fh.write("![[%s]]\n" % nfd_names[0])
+        nfd_result = dependency_status(nfd_images, nfd_owner, nfd_old)
+        check("an NFD old pathname retains its exact external dependency",
+              (nfd_result["ok"], os.path.isfile(os.path.join(nfd_images, nfd_names[0]))),
+              (False, True))
+
+        # The substring prefilter skips the full parse only for notes that
+        # cannot name the old stem, after the same unquote/NFC/casefold.
+        pre_vault, pre_images, _pre_pdfs, pre_owner, _pre_names = \
+            canonical_rename_fixture("prefilter", "Old_Prefilter_2025")
+        os.makedirs(os.path.join(pre_vault, "Wiki"))
+        touch(os.path.join(pre_vault, "Wiki", "unrelated.md"),
+              b"[[Another_Note_2025]] and ![[Another_Note_2025_fig_1.png]]\n")
+        pre_encoded = touch(os.path.join(pre_vault, "Wiki", "encoded.md"),
+                            b"[old](old%5Fprefilter%5F2025.md)\n")
+        pre_cased = touch(os.path.join(pre_vault, "Wiki", "cased.md"),
+                          b"![](OLD_PREFILTER_2025_FIG_1.PNG)\n")
+        parsed = []
+        real_dependency_names = _markdown_dependency_names
+
+        def counting_dependency_names(text, *args, **kwargs):
+            parsed.append(text)
+            return real_dependency_names(text, *args, **kwargs)
+
+        with patch.dict(globals(),
+                        _markdown_dependency_names=counting_dependency_names):
+            pre_report = dependency_status(pre_images, pre_owner,
+                                           "Old_Prefilter_2025")
+        check("the dependency prefilter keeps encoded and case-variant "
+              "references and parses only candidate notes",
+              (pre_report["blockers"], len(parsed)),
+              ([{"path": os.path.realpath(pre_cased),
+                 "references": ["Old_Prefilter_2025_fig_1.png"]},
+                {"path": os.path.realpath(pre_encoded),
+                 "references": ["Old_Prefilter_2025.md"]}], 2))
+        # The full parse blanks a closed `%%` comment; in raw text its closing
+        # `%` plus a slug's first two hex letters (`%Ad`) would decode as one
+        # byte escape and hide the stem from a raw-only prefilter.
+        hex_vault, hex_images, _hex_pdfs, hex_owner, _hex_names = \
+            canonical_rename_fixture("prefilter-hex", "Adams_Robots_2025")
+        os.makedirs(os.path.join(hex_vault, "Wiki"))
+        hex_wiki = touch(
+            os.path.join(hex_vault, "Wiki", "Robots.md"),
+            b"See [[%%old%%Adams_Robots_2025|the article]] and "
+            b"![[%%x%%Adams_Robots_2025_fig_1.png]]\n")
+        hex_link = touch(os.path.join(hex_vault, "Wiki", "Linked.md"),
+                         b"[x](%%c%%Adams_Robots_2025.md) and "
+                         b"[y](<%%c%%Adams_Robots_2025.md>)\n")
+        hex_report = dependency_status(hex_images, hex_owner,
+                                       "Adams_Robots_2025")
+        with patch.dict(globals(), _dependency_needles=lambda *_a: None):
+            hex_full = dependency_status(hex_images, hex_owner,
+                                         "Adams_Robots_2025")
+        check("a hex-letter stem behind a closed %% comment stays a blocker, "
+              "exactly as the full parse reports it",
+              (hex_report["ok"], hex_report["blockers"],
+               hex_report["blockers"] == hex_full["blockers"]),
+              (False,
+               [{"path": os.path.realpath(hex_link),
+                 "references": ["Adams_Robots_2025.md"]},
+                {"path": os.path.realpath(hex_wiki),
+                 "references": ["Adams_Robots_2025.md",
+                                "Adams_Robots_2025_fig_1.png"]}], True))
+        # A board's text cards are prefiltered one by one, after JSON decoding.
+        board_vault, board_images, _p, board_owner, _n = \
+            canonical_rename_fixture("prefilter-canvas", "Adams_Robots_2025")
+        os.makedirs(os.path.join(board_vault, "Boards"))
+        board = touch(
+            os.path.join(board_vault, "Boards", "board.canvas"),
+            b'{"nodes":[{"type":"text","text":"See [[\\u0041dams_Robots_2025]] '
+            b'and ![[%%c%%Adams_Robots_2025_fig_1.png]]"},'
+            b'{"type":"text","text":"Unrelated [[Other_Note_2025]]"}]}\n')
+        parsed.clear()
+        with patch.dict(globals(),
+                        _markdown_dependency_names=counting_dependency_names):
+            board_report = dependency_status(board_images, board_owner,
+                                             "Adams_Robots_2025")
+        with patch.dict(globals(), _dependency_needles=lambda *_a: None):
+            board_full = dependency_status(board_images, board_owner,
+                                           "Adams_Robots_2025")
+        check("a board's text cards are prefiltered after JSON decoding: only "
+              "the citing card is parsed, with the full parse's result",
+              (board_report["blockers"], board_full["blockers"], len(parsed)),
+              ([{"path": os.path.realpath(board),
+                 "references": ["Adams_Robots_2025.md",
+                                "Adams_Robots_2025_fig_1.png"]}],
+               board_report["blockers"], 1))
+        check("the prefilter's %%-blanked view keeps the stem a raw unquote "
+              "would decode away",
+              [("adams_robots_2025" in view) for view in
+               _dependency_prefilter_views("[[%%c%%Adams_Robots_2025]]")],
+              [False, True])
+        check("a key that could compose with a delimiter disables the prefilter",
+              (_dependency_needles("̸Old", []),
+               _dependency_needles("Old", ["old_fig_1.png", "Other_fig_1.png"])),
+              (None, {"old", "other_fig_1.png"}))
+
+        pdf_vault, pdf_images, pdf_sources, pdf_owner, pdf_names = \
+            canonical_rename_fixture("linked-pdf", "Linked_PDF_2025")
+        outside_pdfs = os.path.join(tmp, "linked-pdf-target")
+        os.makedirs(outside_pdfs)
+        touch(os.path.join(outside_pdfs, "Linked_PDF_2025.pdf"), b"%PDF-1.7\n")
+        os.symlink(outside_pdfs, os.path.join(pdf_sources, "linked"))
+        linked_pdf_result = _plan_slug_rename(
+            pdf_images, "Linked_PDF_2025", "New_Linked_2026",
+            sources=pdf_sources, owner_note=pdf_owner)
+        check("PDF ownership inventory follows linked source subfolders",
+              ([row["ok"] for row in linked_pdf_result],
+               os.path.isfile(os.path.join(pdf_images, pdf_names[0]))),
+              ([False], True))
+
+        folder = figures("Old_Slug_2025")
+        out = checked_plan(folder, "Old_Slug_2025", "New_Slug_2026")
+        check("clean handoff planning maps the whole set without changing it",
+              ([e["to"] for e in out], sorted(os.listdir(folder))),
+              (["New_Slug_2026_fig_1.png", "New_Slug_2026_fig_2.png", "New_Slug_2026_fig_3.png"],
+               ["Old_Slug_2025_fig_1.png", "Old_Slug_2025_fig_2.png", "Old_Slug_2025_fig_3.png"]))
+        folder = figures("Old_Slug_2025", ("_fig_1.png", "_fig_2.png"))
+        one_file_owner = clipping_note(
+            "Old_Slug_2025", ("Old_Slug_2025_fig_1.png",))
+        out = _plan_slug_rename(folder, "Old_Slug_2025", "New_Slug_2026",
+                          sources=sources, owner_note=one_file_owner)
+        check("one unattributed same-stem file blocks the whole clipping rename",
+              ([entry["ok"] for entry in out], sorted(os.listdir(folder))),
+              ([False, False],
+               ["Old_Slug_2025_fig_1.png", "Old_Slug_2025_fig_2.png"]))
+        check("the unembedded basename is reported as unproven ownership",
+              sum("ownership is unproven" in (entry["error"] or "")
+                  for entry in out), 1)
+        folder = figures("Old_Slug_2025", ("_fig_1.png",))
+        check("one spelling embedded twice proves ownership; two case "
+              "spellings of it do not",
+              [[entry["ok"] for entry in _plan_slug_rename(
+                  folder, "Old_Slug_2025", "New_Slug_2026", sources=sources,
+                  owner_note=clipping_note("Old_Slug_2025", embeds))]
+               for embeds in (("Old_Slug_2025_fig_1.png",) * 2,
+                              ("Old_Slug_2025_fig_1.png",
+                               "old_slug_2025_FIG_1.png"))],
+              [[True], [False]])
+        # Construct the intentionally pre-convergence test name in two pieces;
+        # the convention harness treats literal full filenames as producer
+        # examples, while this one is explicitly a consumer migration fixture.
+        legacy_missing = "Old_Slug_2025_" + "fig3.jpeg"
+        legacy_new = "New_Slug_2026_" + "fig3.jpeg"
+        missing_owner = clipping_note(
+            "Old_Slug_2025",
+            ("Old_Slug_2025_fig_1.png", legacy_missing,
+             "Other_Slug_2025_fig_9.png", "Old_Slug_2025_fig_notes.md"))
+        out = _plan_slug_rename(folder, "Old_Slug_2025", "New_Slug_2026",
+                          sources=sources, owner_note=missing_owner)
+        check("a missing legacy loose old-slug image embed blocks the whole rename",
+              ([entry["ok"] for entry in out], sorted(os.listdir(folder))),
+              ([False, False], ["Old_Slug_2025_fig_1.png"]))
+        check("the missing embed is a deterministic plan row with its new name",
+              [(entry["from"], entry["to"])
+               for entry in out if "exact attachment is missing" in
+               (entry["error"] or "")],
+              [(legacy_missing, legacy_new)])
+        check("other-slug and non-image embeds are excluded from the rename inventory",
+              [entry["from"] for entry in out],
+              ["Old_Slug_2025_fig_1.png", legacy_missing])
+        empty_folder = figures("Empty_Slug_2025", ())
+        near_miss_missing = "Empty_Slug_2025_" + "figure_7.tif"
+        broken_owner = clipping_note(
+            "Empty_Slug_2025", (near_miss_missing,))
+        out = _plan_slug_rename(empty_folder, "Empty_Slug_2025", "New_Slug_2026",
+                          sources=sources, owner_note=broken_owner)
+        check("an empty folder with a missing embedded figure is reported as failed",
+              (len(out), out[0]["ok"], "exact attachment is missing" in
+               (out[0]["error"] or "")), (1, False, True))
+        check("renaming a stem with no figures is empty, not an error",
+              checked_plan(folder, "Nobody_Home_2020", "X_2021"), [])
+        folder = figures("müLLER_Trial_2025", ("_fig_1.png",))
+        out = checked_plan(folder, unicodedata.normalize("NFD", "Müller_Trial_2025"),
+                          "Muller_New_2026")
+        check("different case and Unicode spellings still map the real figure without moving it",
+              ([entry["to"] for entry in out], sorted(os.listdir(folder))),
+              (["Muller_New_2026_fig_1.png"], ["müLLER_Trial_2025_fig_1.png"]))
+        folder = figures("STRASSE_Trial_2025", ("_fig_1.png",))
+        expansion_is_same_name = os.path.exists(
+            os.path.join(folder, "Straße_Trial_2025_fig_1.png"))
+        out = checked_plan(folder, "Straße_Trial_2025", "New_Trial_2026")
+        check("casefold expansion follows only when the filesystem says it is one name",
+              ([entry["to"] for entry in out], [entry["ok"] for entry in out],
+               sorted(os.listdir(folder))),
+              ((["New_Trial_2026_fig_1.png"], [True],
+                ["STRASSE_Trial_2025_fig_1.png"])
+               if expansion_is_same_name else
+               ([], [], ["STRASSE_Trial_2025_fig_1.png"])))
+        folder = figures("STRASSE_Trial_2025", ("_fig_1.png",))
+        with patch("os.path.samefile", return_value=False):
+            check("a case-sensitive filesystem does not select a casefold-expanded stem",
+                  _glob_slug(folder, "Straße_Trial_2025", _FIG_GLOB), [])
+        folder = figures("Old_Slug_2025")
+        touch(os.path.join(folder, "new_slug_2026_fig_2.webp"), b"other owner")
+        before_set = sorted(os.listdir(folder))
+        out = checked_plan(folder, "Old_Slug_2025", "New_Slug_2026")
+        check("handoff planning refuses another format in its destination slot",
+              ([entry["ok"] for entry in out], sorted(os.listdir(folder))),
+              ([False, False, False], before_set))
+        folder = figures("Old_Slug_2025")
+        os.mkdir(os.path.join(folder, "Old_Slug_2025_fig_assets"))
+        check("a matching directory refuses the rename instead of moving user content",
+              all(not entry["ok"] for entry in checked_plan(
+                  folder, "Old_Slug_2025", "New_Slug_2026")), True)
+        folder = figures("Old_Slug_2025", ())
+        backing = touch(os.path.join(folder, "backing.png"), _PNG)
+        linked = os.path.join(folder, "Old_Slug_2025_fig_1.png")
+        os.symlink(backing, linked)
+        out = checked_plan(folder, "Old_Slug_2025", "New_Slug_2026")
+        check("a matching symlink is not treated as a regular image move",
+              ([entry["ok"] for entry in out], os.path.islink(linked),
+               open(backing, "rb").read()), ([False], True, _PNG))
+
+        # §8a: a CONSUMER matches `<stem>_fig`, never `<stem>_fig_`. This side
+        # globbed the strict form, so a vault holding pre-convergence names
+        # (§8c) had them left behind under the OLD stem while the note's embeds
+        # all moved — and the report said `{"renamed": 3, "failed": 0}`.
+        # The two pre-convergence spellings, written out literally because
+        # what the case is about is exactly that files named this way are
+        # still on disk in long-lived vaults and the loose §8a glob has to
+        # take them. Pre-convergence, so the number sits straight on `_fig`:
+        old = "_fig3.png"                # pre-convergence: no separator
+        old_s1 = "_figS1.png"            # pre-convergence, supplementary
+        folder = figures("Old_Slug_2025", ("_fig_1.png", "_fig_2.webp", old))
+        out = checked_plan(folder, "Old_Slug_2025", "New_Slug_2026")
+        check("the loose consumer plan includes pre-convergence spelling without moving it",
+              (sorted(e["to"] for e in out), sorted(os.listdir(folder))),
+              (sorted(["New_Slug_2026" + old, "New_Slug_2026_fig_1.png", "New_Slug_2026_fig_2.webp"]),
+               sorted(["Old_Slug_2025" + old, "Old_Slug_2025_fig_1.png", "Old_Slug_2025_fig_2.webp"])))
+        # Adversarial near-miss: a hand-named `_figure_3.png` matches this
+        # stem's loose consumer prefix; preserve its tail verbatim.
+        folder = figures("Old_Slug_2025", ("_fig_1.png", "_figure_3.png"))
+        out = checked_plan(folder, "Old_Slug_2025", "New_Slug_2026")
+        check("hand-named figure tails are mapped verbatim without moving them",
+              ([e["to"] for e in out], sorted(os.listdir(folder))),
+              # Both expected lists retain the hand-named tail unchanged.
+              (["New_Slug_2026_fig_1.png", "New_Slug_2026_figure_3.png"],
+               ["Old_Slug_2025_fig_1.png", "Old_Slug_2025_figure_3.png"]))
+        # the ownership guard has to read the older spelling as well, or a
+        # loose glob just widens what gets taken from the other producer
+        folder = figures("Doe_Old_2025", ("_fig_1.png", old_s1))
+        out = checked_plan(folder, "Doe_Old_2025", "New_Note_2026")
+        check("a pre-convergence supplementary label still refuses the set",
+              ([e["ok"] for e in out], sorted(os.listdir(folder))),
+              ([False, False],
+               sorted(["Doe_Old_2025" + old_s1, "Doe_Old_2025_fig_1.png"])))
+        check("...naming the label as the reason, as it does for `_fig_S1`",
+              sum("figure-extract" in (e["error"] or "") for e in out), 1)
+
+        # ALL OR NOTHING. One occupied destination used to stop the loop with
+        # the earlier files already renamed: the note's embeds point at one
+        # slug, so half of them resolved to nothing and no re-run could put the
+        # set back together.
+        folder = figures("Old_Slug_2025")
+        touch(os.path.join(folder, "New_Slug_2026_fig_2.png"), b"someone else's")
+        out = checked_plan(folder, "Old_Slug_2025", "New_Slug_2026")
+        check("one occupied destination refuses the whole set",
+              [e["ok"] for e in out], [False, False, False])
+        check("...naming the file that blocked it",
+              sum("destination exists" in (e["error"] or "") for e in out), 1)
+        check("...and the others say why they were not done",
+              sum("all or nothing" in (e["error"] or "") for e in out), 2)
+        check("...with nothing renamed and nothing lost",
+              sorted(os.listdir(folder)),
+              ["New_Slug_2026_fig_2.png", "Old_Slug_2025_fig_1.png",
+               "Old_Slug_2025_fig_2.png", "Old_Slug_2025_fig_3.png"])
+        check("...and the occupied destination is untouched",
+              open(os.path.join(folder, "New_Slug_2026_fig_2.png"), "rb").read(),
+              b"someone else's")
+        out = checked_plan(folder, "Old_Slug_2025", "New_Slug_2026")
+        check("repeated planning reports the same occupied-slot refusal",
+              [e["ok"] for e in out], [False, False, False])
+        folder = figures("Old_Slug_2025")
+        out = checked_plan(folder, "Old_Slug_2025", "New_Slug_2026")
+        check("planning a clean set reports every file and writes nothing",
+              ([e["ok"] for e in out],
+               sorted(os.listdir(folder))[0]),
+              ([True, True, True], "Old_Slug_2025_fig_1.png"))
+
+        # Handoff identity checks distinguish different files from two names
+        # for the same inode; portable spelling alone cannot establish that.
+        one = touch(os.path.join(tmp, "one"), b"x")
+        two = os.path.join(tmp, "two")
+        check("_same_file: a path is itself", _same_file(one, one), True)
+        check("_same_file: a missing path is not a match",
+              _same_file(one, os.path.join(tmp, "nope")), False)
+        check("_same_file: two different files are not one",
+              _same_file(one, touch(two, b"y")), False)
+        os.unlink(two)
+        os.link(one, two)
+        check("_same_file recognizes distinct names for one inode",
+              _same_file(one, two), True)
+
+        # Sources/Images is FLAT and shared. Two guards say the stem is a PDF's.
+        folder = figures("Doe_Foo_2025", ("_fig_1.png", "_fig_S1.png"))
+        out = checked_plan(folder, "Doe_Foo_2025", "New_Note_2026")
+        check("a supplementary label refuses the set",
+              [e["ok"] for e in out], [False, False])
+        check("...naming the label as the reason",
+              sum("figure-extract" in (e["error"] or "") for e in out), 1)
+        check("...and moves nothing",
+              sorted(os.listdir(folder)),
+              ["Doe_Foo_2025_fig_1.png", "Doe_Foo_2025_fig_S1.png"])
+        for label in ("_fig_ED2.png", "_fig_SI3.png", "_fig_1-2.png",
+                      "_fig_2.1.png"):
+            folder = figures("Doe_Bar_2025", ("_fig_1.png", label))
+            out = checked_plan(folder, "Doe_Bar_2025", "New_Note_2026")
+            check("a %s label is figure-extract's" % label,
+                  any(e["ok"] for e in out), False)
+        # ...and a plain integer label can pass with exact clipping ownership.
+        folder = figures("Doe_Baz_2025", ("_fig_1.png", "_fig_12.png"))
+        out = checked_plan(folder, "Doe_Baz_2025", "New_Note_2026")
+        check("a plain integer label is this skill's", [e["ok"] for e in out],
+              [True, True])
+        folder = figures("Doe_Fig_S1_2025", ("_fig_1.png",))
+        check("PDF-only label syntax inside a clipping title does not own its figures",
+              [e["ok"] for e in checked_plan(
+                  folder, "Doe_Fig_S1_2025", "Doe_Trial_2025")], [True])
+
+        # ...and a `<stem>.pdf` on disk settles ownership outright
+        os.makedirs(os.path.join(sources, "sub"))
+        touch(os.path.join(sources, "sub", "Doe_Qux_2025.pdf"))
+        folder = figures("Clipping_Topic_2025", ("_fig_1.png",))
+        check("a PDF also reserves the destination stem before figures exist",
+              [entry["ok"] for entry in checked_plan(
+                  folder, "Clipping_Topic_2025", "Doe_Qux_2025", sources=sources)],
+              [False])
+        with open(os.path.join(folder, MANIFEST_FILE), "w",
+                  encoding="utf-8") as fh:
+            fh.write("Reserved_Paper_2025_fig_1.png\t" + hashlib.sha256(_PNG).hexdigest() + "\n")
+        check("a missing figure's PDF manifest record still reserves the rename destination",
+              [entry["ok"] for entry in checked_plan(
+                  folder, "Clipping_Topic_2025", "Reserved_Paper_2025")], [False])
+        with open(os.path.join(folder, MANIFEST_FILE), "w",
+                  encoding="utf-8") as fh:
+            fh.write("Reserved_Paper_2025_fig_1.webp\t" + hashlib.sha256(_PNG).hexdigest() + "\n")
+        check("manifest ownership reserves the destination index across extensions",
+              [entry["ok"] for entry in checked_plan(
+                  folder, "Clipping_Topic_2025", "Reserved_Paper_2025")], [False])
+        folder = figures("Doe_Qux_2025", ("_fig_1.png",))
+        out = checked_plan(folder, "Doe_Qux_2025", "New_Note_2026",
+                          sources=sources)
+        check("a PDF of that stem refuses the rename",
+              [e["ok"] for e in out], [False])
+        check("...naming pdf-organize as whose move it is",
+              "pdf-organize" in (out[0]["error"] or ""), True)
+        check("...and leaves the figures alone",
+              os.listdir(folder), ["Doe_Qux_2025_fig_1.png"])
+        folder = figures("Clipping_No_PDF_2025", ("_fig_1.png",))
+        check("...while a stem with no PDF can be planned normally",
+              [e["ok"] for e in checked_plan(
+                  folder, "Clipping_No_PDF_2025", "New_Note_2026")], [True])
+        accented = "Müller_Topic_2026"
+        touch(os.path.join(sources, "sub", unicodedata.normalize("NFD", accented) + ".pdf"))
+        folder = figures(accented, ("_fig_1.png",))
+        out = checked_plan(folder, accented, "New_Note_2026", sources=sources)
+        check("an NFD PDF filename still owns an NFC figure stem",
+              [e["ok"] for e in out], [False])
+        check("...and its figures stay under their original stem",
+              os.listdir(folder), [accented + "_fig_1.png"])
+        raises("a mistyped --sources path cannot silently disable ownership checks",
+                   checked_plan, folder, accented, "New_Note_2026",
+               sources=os.path.join(sources, "missing-folder"))
+        scandir = os.scandir
+
+        def unreadable_sources(path):
+            if path == os.path.join(sources, "sub"):
+                raise PermissionError(13, "permission denied", path)
+            return scandir(path)
+
+        before = {name: open(os.path.join(folder, name), "rb").read()
+                  for name in os.listdir(folder)}
+        with patch.object(os, "scandir", side_effect=unreadable_sources):
+            raises("an incomplete PDF inventory cannot authorize an image rename",
+               checked_plan, folder, accented, "New_Note_2026", sources=sources)
+        check("failed ownership enumeration preserves every image name and byte",
+              {name: open(os.path.join(folder, name), "rb").read()
+               for name in os.listdir(folder)}, before)
+        raises("handoff planning validates both slugs", checked_plan, folder,
+               "../old", "new")
+        raises("...including the new one", checked_plan, folder, "old",
+               "../new")
+
+        # --- the documented procedures, which are the other half of a guard --
+        # A guard the prose routes around is not a guard. Each case below was a
+        # live bypass: a `rename` invocation with no `--sources` (so the
+        # ownership refusal never engaged), a stem-owner probe that could not
+        # see into `Sources/PDFs/<Work>/`, a caps list read as fixed properties
+        # when three are flags, and a Lottie converter doing its own fetch and
+        # its own write into Sources/Images with none of this file's guards.
+        def doc(*parts):
+            path = os.path.normpath(os.path.join(
+                os.path.dirname(os.path.abspath(__file__)), "..", *parts))
+            try:
+                with open(path, encoding="utf-8") as fh:
+                    return fh.read()
+            except OSError as exc:
+                cases.append(("%s sits next to this script" % "/".join(parts),
+                              False, "%s: %s" % (type(exc).__name__, exc),
+                              "readable"))
+                return ""
+
+        skill_md = doc("SKILL.md")
+        images_md = doc("references", "images.md")
+        reprocess_md = doc("references", "duplicates-and-reprocessing.md")
+        lottie_md = doc("references", "lottie-recovery.md")
+
+        # `rename`'s ownership guard is real, and `--sources` is what arms it.
+        # It appeared in NO markdown file, so both documented invocations ran
+        # without it and the refusal never fired in practice.
+        commands = re.sub(r"\\\r?\n[ \t]*", " ",
+                          skill_md + "\n" + images_md + "\n" + reprocess_md)
+        rename_calls = re.findall(
+            r"fetch_images\.py['\"]? rename[^\n`]*--attachments[^\n`]*",
+            commands)
+        check("every documented `rename` invocation passes --sources",
+              (len(rename_calls) >= 1,
+               [c for c in rename_calls if "--sources" not in c]),
+              (True, []))
+        check("every documented `rename` invocation passes --owner-note",
+              (len(rename_calls) >= 1,
+               [c for c in rename_calls if "--owner-note" not in c]),
+              (True, []))
+        check("every documented `rename` invocation selects an explicit phase",
+              (len(rename_calls) >= 1,
+               [c for c in rename_calls if "--phase" not in c]),
+              (True, []))
+        replacement_anchor = (
+            "duplicates-and-reprocessing.md#publish-an-approved-replacement")
+        images_words = " ".join(images_md.split()).casefold()
+        reprocess_words = " ".join(reprocess_md.split()).casefold()
+        check("the image procedure routes changed slugs to the canonical "
+              "replacement protocol",
+              replacement_anchor in images_words and
+              "## publish an approved replacement" in reprocess_words and
+              "never use bare `cp`/`mv`, omit either owner guard" in images_words,
+              True)
+        check("the canonical replacement protocol explains exact positive "
+              "clipping ownership",
+              "first current `sources:` item is a web url" in reprocess_words and
+              "every old image and mapped destination to be an exact rendered"
+              in reprocess_words and
+              "--owner-note" in reprocess_words, True)
+        check("changed-slug docs require the vault-wide dependency probe",
+              ("every markdown note and obsidian canvas board outside the owner"
+               in reprocess_words
+               and "fetch_images.py' dependencies" in reprocess_words
+               and "unchanged re-probe" in images_words
+               and replacement_anchor in images_words), True)
+        check("dependency refusal is reported before destructive old-path cleanup",
+              ("never delete first" in reprocess_words
+               and "earlier probe is not standing cleanup authority" in reprocess_words
+               and "reports the blocker or" in reprocess_words), True)
+        check("a legacy source: is migrated before any --owner-note command",
+              ("**legacy origin.**" in reprocess_words
+               and "one-item `sources:` list" in reprocess_words
+               and "migrate it first as in" in images_words), True)
+        check("a created new note is recorded at once, and only it is "
+              "withdrawn after a prepare refusal",
+              ("--replace 'articles/<new_slug>.md'" in reprocess_words
+               and "--snapshots '<scratch>/clipping-snapshots.json' "
+                   "'articles/<new_slug>.md'" in reprocess_words
+               and "publish-note reported `created` in this run"
+                   in reprocess_words), True)
+        check("a handoff stopped after finalize goes to the re-probe and "
+              "old-note removal",
+              ("stopped after finalize" in reprocess_words
+               and "finalize already retired the old images" in reprocess_words
+               and "go straight to step 9" in reprocess_words), True)
+        # The swapped pair reads the same, so the record alone gives the
+        # direction, and step 9 removes it with the old note.
+        check("a pending pair takes its direction from the handoff record, "
+              "never from the notes",
+              ("take the direction from the pair's "
+               "`articles/.<new_slug>.handoff.json`" in reprocess_words
+               and "never infer it from the notes" in reprocess_words
+               and "'articles/<old_slug>.md' \\ "
+                   "'articles/.<new_slug>.handoff.json'" in reprocess_words),
+              True)
+        # publish-note refuses a respelling, so the docs keep the spelling.
+        check("a case or Unicode respelling keeps the note's and images' "
+              "spelling and takes a same-name rewrite",
+              ("only by case or unicode normalization is still correct: keep "
+               "its spelling and its images' names" in reprocess_words
+               and "differs only by case or unicode normalization is not a "
+                   "change" in " ".join(skill_md.split()).casefold()
+               and "respelled" not in reprocess_words), True)
+        # publish-note and prepare require the old note's origin, so an
+        # overwrite from an m./AMP or other URL-variant capture keeps it.
+        check("an overwrite from a URL-variant capture keeps the existing "
+              "note's origin",
+              ("the draft keeps the existing note's first current `sources:` "
+               "url" in reprocess_words
+               and "an approved overwrite keeps the existing note's origin "
+                   "url" in reprocess_words), True)
+        # A raw has no block IDs, and other notes link the old note's blocks.
+        check("a reprocess carries the old note's block IDs into the draft, "
+              "and repair names each anchor the new note lacks",
+              ("carry each block id byte-for-byte onto the matching block"
+               in reprocess_words
+               and "`missing_anchors`" in reprocess_words
+               and "`missing_anchors`" in skill_md), True)
+        check("repair covers a note reached through a vault folder link",
+              "a note reached through a vault folder link is repaired like "
+              "any other" in reprocess_words, True)
+        # A changed slug runs the shipped writer with its guards, never a
+        # hand-written driver.
+        publish_note_calls = re.findall(
+            r"fetch_images\.py['\"]? rename --phase publish-note[^\n`]*",
+            commands)
+        check("changed-slug note publication runs the shipped publish-note "
+              "writer with the snapshot file and the scratch draft",
+              (len(publish_note_calls) >= 1,
+               [c for c in publish_note_calls
+                if not all(flag in c for flag in (
+                    "--vault", "--snapshots", "--draft", "--owner-note",
+                    "--new-owner-note", "--old-slug", "--new-slug"))],
+               "rename --phase publish-note" in skill_md),
+              (True, [], True))
+
+        # `Sources/PDFs/` is recursive by contract (a split book lives in
+        # `Sources/PDFs/<Work>/`), so the step-3 stem-owner probe has to
+        # recurse. `ls -d '<vault>/Sources/PDFs/<slug>.'*` could not see a
+        # chapter stem, and the collision it exists to catch went unreported.
+        check("the naming procedure checks PDF stems recursively",
+              bool(re.search(r"PDF stems throughout recursive\s+`Sources/PDFs/`",
+                             reprocess_md)), True)
+        check("...and no longer globs that folder one level deep",
+              "ls -d '<vault>/Sources/PDFs/" in skill_md + reprocess_md, False)
+
+        # The caps are defaults behind flags, and `--allow-private-hosts` turns
+        # off a guard the same bullet list sells as unconditional. None of the
+        # four was named anywhere in the prose.
+        for flag in ("--max-bytes", "--max-seconds", "--timeout",
+                     "--allow-private-hosts"):
+            check("references/images.md names %s" % flag, flag in images_md,
+                  True)
+        check("...and explains that --allow-private-hosts enables private destinations",
+              bool(re.search(r"--allow-private-hosts[^\n]*enables[^\n]*private",
+                             images_md)), True)
+
+        # The Lottie converter: the download and the final placement must go
+        # through this script, and the shipped renderer must keep to rendering.
+        check("the documented Lottie flow fetches through this script",
+              "fetch_images.py' fetch" in lottie_md, True)
+        check("...and places through this script",
+              "fetch_images.py' place" in lottie_md, True)
+        converter = None
+        try:
+            with open(os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                                   "lottie_to_gif.py"), encoding="utf-8") as fh:
+                converter = fh.read()
+        except OSError:
+            pass
+        check("the documented Lottie flow renders with the shipped converter",
+              (converter is not None, "scripts/lottie_to_gif.py" in lottie_md),
+              (True, True))
+        if converter is not None:
+            body = converter
+            # its comments explain what it no longer does, so judge the CODE
+            code = "\n".join(ln for ln in body.split("\n")
+                             if not ln.lstrip().startswith("#"))
+            check("the converter does not fetch anything itself",
+                  ("urlopen" in code, "urllib" in code), (False, False))
+            check("...and does not write its scratch file beside its output",
+                  ('out + ".tmp' in code, "mkstemp" in code), (False, True))
+            check("...and does not name Sources/Images in its code at all",
+                  "Sources/Images" in code, False)
+            # It parses, and it escapes the animation for HTML embedding: a
+            # `</script>` inside any string field of a hostile Lottie used to
+            # close the tag early, so the generated page ran a THIRD script
+            # tag the animation's author wrote.
+            ns = {"__name__": "_selftest_not_main", "__file__": __file__}
+            try:
+                exec(compile(body, "lottie_to_gif.py", "exec"), ns)
+                cases.append(("the converter's module body still parses and "
+                              "runs (no import-time side effects)", True,
+                              "ok", "ok"))
+            except Exception as exc:                      # noqa: BLE001
+                cases.append(("the converter's module body still parses and "
+                              "runs (no import-time side effects)", False,
+                              "%s: %s" % (type(exc).__name__, exc), "ok"))
+            embed = ns.get("json_for_script")
+            check("the converter exposes the JSON-for-<script> escaper",
+                  callable(embed), True)
+            if not callable(embed):
+                # what the converter used to interpolate, so the two cases
+                # below still RUN — and fail — rather than quietly not running
+                embed = json.dumps
+            hostile = {"nm": "</script><script>fetch('http://evil/')</script>",
+                       "op": 2, "w": 1, "h": 1}
+            emb = embed(hostile)
+            page = ("<script>lottie.loadAnimation({animationData:%s});"
+                    "</script>" % emb)
+            check("a hostile Lottie cannot close the <script> tag",
+                  (page.lower().count("<script"), "</script" in emb.lower()),
+                  (1, False))
+            check("...and the escaped JSON still decodes to the same animation",
+                  json.loads(emb), hostile)
+            validate_anim = ns.get("validate_anim")
+            check("the renderer validates untrusted animation data before launch",
+                  callable(validate_anim), True)
+            if callable(validate_anim):
+                base_anim = {"w": 100, "h": 100, "fr": 30, "ip": 0, "op": 60,
+                             "layers": []}
+                check("a self-contained animation passes renderer preflight",
+                      validate_anim(base_anim), None)
+                for label, extra in (
+                        ("an external image", {"assets": [{"p": "figure.png", "u": "https://example.com/"}]}),
+                        ("a private image URL", {"assets": [{"p": "http://127.0.0.1/image"}]}),
+                        ("an external font", {"fonts": {"list": [{"fPath": "https://example.com/font.woff"}]}}),
+                        ("an expression", {"layers": [{"ks": {"o": {"x": "fetch('https://example.com/')"}}}]}),
+                        ("zero frame rate", {"fr": 0}),
+                        ("an infinite dimension", {"w": float("inf")}),
+                        ("no frames", {"op": 0})):
+                    raises("renderer refuses %s before browser work" % label,
+                           validate_anim, {**base_anim, **extra})
+                check("embedded image bytes need no network permission",
+                      validate_anim({**base_anim,
+                                     "assets": [{"p": data_url, "e": 1}]}), None)
+            allowed = ns.get("render_request_allowed")
+            check("the renderer exposes its network allowlist", callable(allowed), True)
+            if callable(allowed):
+                check("only the fixed renderer library may be fetched",
+                      [allowed(url) for url in (ns["LOTTIE_CDN"],
+                       "http://127.0.0.1/image", "https://example.com/asset",
+                       ns["LOTTIE_CDN"] + "?redirect=elsewhere")],
+                      [True, False, False, False])
+            publish_scratch = ns.get("publish_scratch")
+            check("the renderer exposes exclusive scratch publication",
+                  callable(publish_scratch), True)
+            if callable(publish_scratch):
+                rendered = os.path.join(tmp, "lottie-rendered.gif")
+                published = os.path.join(tmp, "lottie-published.gif")
+                with open(rendered, "wb") as fh:
+                    fh.write(b"GIF89a-new")
+                publish_scratch(rendered, published)
+                check("scratch publication moves complete bytes to a new name",
+                      (os.path.lexists(rendered), open(published, "rb").read()),
+                      (False, b"GIF89a-new"))
+                retry = os.path.join(tmp, "lottie-retry.gif")
+                with open(retry, "wb") as fh:
+                    fh.write(b"GIF89a-retry")
+                try:
+                    publish_scratch(retry, published)
+                    output_refused = False
+                except FileExistsError:
+                    output_refused = True
+                check("scratch publication refuses an existing output",
+                      output_refused, True)
+                check("a refused scratch publication preserves both occupants",
+                      (open(retry, "rb").read(), open(published, "rb").read()),
+                      (b"GIF89a-retry", b"GIF89a-new"))
+            if callable(ns.get("load_anim")):
+                raises("the renderer also refuses duplicate manifest names",
+                       ns["load_anim"], duplicate_manifest)
+                raises("the renderer also refuses duplicate animation names",
+                       ns["load_anim"], duplicate_animation)
+                packed = os.path.join(tmp, "oversized.lottie")
+                with zipfile.ZipFile(packed, "w", zipfile.ZIP_DEFLATED) as archive:
+                    archive.writestr(
+                        "manifest.json",
+                        '{"version":"1","animations":[{"id":"a"}]}')
+                    # Valid JSON, so only the cap can refuse it.
+                    archive.writestr("animations/a.json",
+                                     b'{"layers": []' + b" " * 1024 + b"}")
+                raises("a small ZIP cannot expand past the animation JSON cap",
+                       ns["load_anim"], packed, cap=64)
+
+        # Fresh-note downloads must remain outside the vault until a public
+        # owner note exists. Exercise the CLI branch end to end with a data URI.
+        stage_vault = os.path.join(tmp, "stage-vault")
+        os.mkdir(stage_vault)
+        stage_out = os.path.join(tmp, "stage-output")
+        stage_stdout = io.StringIO()
+        with patch.object(sys, "stdout", stage_stdout):
+            stage_code = main([
+                "stage", "--vault", stage_vault, "--out-dir", stage_out,
+                "--slug", "Example_Image_2026",
+                "data:image/png;base64," +
+                base64.b64encode(_PNG).decode("ascii"),
+            ])
+        stage_report = json.loads(stage_stdout.getvalue())
+        check("stage CLI downloads a fresh-note image only to outside scratch",
+              (stage_code, stage_report["mode"],
+               os.path.isfile(os.path.join(
+                   stage_out, "Example_Image_2026_fig_1.png")),
+               _inside_existing_directory(stage_out, stage_vault)),
+              (0, "stage", True, False))
+        equal_vault = os.path.join(tmp, "empty-stage-vault")
+        os.mkdir(equal_vault)
+        equal_stdout = io.StringIO()
+        with patch.object(sys, "stdout", equal_stdout):
+            equal_code = main([
+                "stage", "--vault", equal_vault, "--out-dir", equal_vault,
+                "--slug", "Example_Image_2026",
+                "data:image/png;base64," +
+                base64.b64encode(_PNG).decode("ascii"),
+            ])
+        equal_report = json.loads(equal_stdout.getvalue())
+        check("stage refuses the vault root itself as an outside scratch directory",
+              (equal_code, "outside --vault" in equal_report.get("error", ""),
+               os.listdir(equal_vault)), (1, True, []))
+        populated = os.path.join(tmp, "populated-stage")
+        os.mkdir(populated)
+        touch(os.path.join(populated, "Example_Image_2026_fig_1.png"), b"earlier run")
+        populated_stdout = io.StringIO()
+        with patch.object(sys, "stdout", populated_stdout):
+            populated_code = main([
+                "stage", "--vault", stage_vault, "--out-dir", populated,
+                "--slug", "Example_Image_2026", "--start", "2",
+                "data:image/png;base64," +
+                base64.b64encode(_PNG).decode("ascii"),
+            ])
+        check("stage refuses a populated --out-dir without writing into it",
+              (populated_code,
+               "new or empty" in json.loads(
+                   populated_stdout.getvalue()).get("error", ""),
+               sorted(os.listdir(populated))),
+              (1, True, ["Example_Image_2026_fig_1.png"]))
+
+        # --- rename --phase publish-note: the shipped changed-slug writer ---
+        def note_vault(name, old_slug="Old_Note_2025", mode=0o600,
+                       origin="https://example.com/article", marker=""):
+            """A vault with one recorded clipping note and a scratch draft."""
+            root = os.path.join(tmp, name)
+            os.makedirs(os.path.join(root, "Articles"))
+            old = os.path.join(root, "Articles", old_slug + ".md")
+            with open(old, "w", encoding="utf-8") as fh:
+                fh.write('---\nsources:\n  - "%s"\n---\n%sOld body.\n'
+                         % (origin, marker))
+            os.chmod(old, mode)
+            draft_path = os.path.join(tmp, name + "-draft.md")
+            with open(draft_path, "w", encoding="utf-8") as fh:
+                fh.write('---\nsources:\n  - "%s"\n---\nNew body.\n'
+                         % "https://example.com/article")
+            return root, old, draft_path
+
+        def record(root, *keys):
+            snap_path = os.path.join(tmp, os.path.basename(root) + "-snap.json")
+            payload, code = publish_files.cmd_snapshot(
+                root, list(keys), output=snap_path)
+            if code:
+                raise AssertionError("snapshot failed: %r" % (payload,))
+            return snap_path
+
+        def publish_note_cli(root, snap_path, draft_path, old_slug, new_slug,
+                             *extra):
+            out = io.StringIO()
+            with patch.object(sys, "stdout", out):
+                code = main([
+                    "rename", "--phase", "publish-note", *extra,
+                    "--vault", root, "--snapshots", snap_path,
+                    "--draft", draft_path,
+                    "--owner-note", os.path.join(
+                        root, "Articles", old_slug + ".md"),
+                    "--new-owner-note", os.path.join(
+                        root, "Articles", new_slug + ".md"),
+                    "--old-slug", old_slug, "--new-slug", new_slug])
+            return code, json.loads(out.getvalue())
+
+        def residue(root):
+            return sorted(name for name in os.listdir(root)
+                          if name.startswith("."))
+
+        def read_bytes(path):
+            with open(path, "rb") as fh:
+                return fh.read()
+
+        root, old, draft_path = note_vault("publish-note-vault")
+        snap = record(root, "Articles/Old_Note_2025.md",
+                      "Articles/New_Note_2026.md")
+        new = os.path.join(root, "Articles", "New_Note_2026.md")
+        handoff_json = os.path.join(root, "Articles",
+                                    ".New_Note_2026.handoff.json")
+        old_bytes = read_bytes(old)
+        code, out = publish_note_cli(root, snap, draft_path, "Old_Note_2025",
+                                     "New_Note_2026", "--dry-run")
+        check("publish-note --dry-run plans a free-destination publication "
+              "and writes nothing",
+              (code, out["action"], out["file_mode"], os.path.lexists(new),
+               os.path.lexists(handoff_json), residue(root)),
+              (0, "would-create", 0o600, False, False, []))
+        code, out = publish_note_cli(root, snap, draft_path, "Old_Note_2025",
+                                     "New_Note_2026")
+        check("publish-note publishes the draft at the free destination "
+              "with the old note's recorded mode",
+              (code, out["action"], read_bytes(new) == read_bytes(draft_path),
+               stat.S_IMODE(os.lstat(new).st_mode)),
+              (0, "created", True, 0o600))
+        check("...and keeps the unchanged old note and no private stage",
+              (read_bytes(old) == old_bytes, residue(root)), (True, []))
+        check("...and records which note the handoff replaces",
+              (out["handoff_record"], json.loads(read_bytes(handoff_json))),
+              ("Articles/.New_Note_2026.handoff.json",
+               {"old_note": "Articles/Old_Note_2025.md",
+                "new_note": "Articles/New_Note_2026.md"}))
+        code, out = publish_note_cli(root, snap, draft_path, "Old_Note_2025",
+                                     "New_Note_2026")
+        check("a publish-note rerun after success reports the draft as "
+              "already published", (code, out["action"]), (0, "unchanged"))
+        # The pending pair's new note cannot start another handoff, and a
+        # record naming another pair keeps its new name.
+        refusals = []
+        for args in (("New_Note_2026", "Newer_Note_2027"),
+                     ("Old_Note_2025", "New_Note_2026")):
+            if args[0] == "Old_Note_2025":
+                touch(handoff_json, b'{"old_note": "Articles/Other_2024.md", '
+                      b'"new_note": "Articles/New_Note_2026.md"}\n')
+                other = touch(os.path.join(root, "Articles", "Other_2024.md"))
+            code, out = publish_note_cli(root, snap, draft_path, *args,
+                                         "--dry-run")
+            refusals.append((code, out.get("error", "")))
+        check("publish-note refuses the new note of a pending handoff and a "
+              "record of another pair",
+              [(code, phrase in error) for (code, error), phrase in zip(
+                  refusals, ("new note of a pending handoff",
+                             "records a handoff from Other_2024.md"))],
+              [(1, True), (1, True)])
+        os.remove(other)
+        code, out = publish_note_cli(root, snap, draft_path, "Old_Note_2025",
+                                     "New_Note_2026", "--dry-run")
+        check("...and names a record whose old note is gone as finished, "
+              "for removal",
+              (code, "records a finished handoff from Other_2024.md"
+               in out.get("error", "")), (1, True))
+
+        root, old, draft_path = note_vault("publish-note-changed")
+        snap = record(root, "Articles/Old_Note_2025.md",
+                      "Articles/New_Note_2026.md")
+        with open(old, "a", encoding="utf-8") as fh:
+            fh.write("A later user edit.\n")
+        code, out = publish_note_cli(root, snap, draft_path, "Old_Note_2025",
+                                     "New_Note_2026")
+        check("publish-note refuses an old note that changed after its "
+              "record and publishes nothing",
+              (code, out["ok"], "changed" in out.get("error", ""),
+               os.path.lexists(os.path.join(root, "Articles",
+                                            "New_Note_2026.md")),
+               residue(root)), (1, False, True, False, []))
+
+        root, old, draft_path = note_vault("publish-note-late-edit")
+        snap = record(root, "Articles/Old_Note_2025.md",
+                      "Articles/New_Note_2026.md")
+        real_observe = publish_files.observe
+        seen = []
+
+        def late_edit_observe(target):
+            if os.path.basename(target) == "Old_Note_2025.md":
+                seen.append(target)
+                if len(seen) > 1:      # the recheck just before publication
+                    return "absent", None, None
+            return real_observe(target)
+
+        with patch.object(publish_files, "observe", late_edit_observe):
+            code, out = publish_note_cli(root, snap, draft_path,
+                                         "Old_Note_2025", "New_Note_2026")
+        check("publish-note rechecks the old note just before publication "
+              "and removes its unused private stage",
+              (code, out["action"], "nothing was published" in out["detail"],
+               "stage_dir" in out, residue(root),
+               os.path.lexists(os.path.join(root, "Articles",
+                                            "New_Note_2026.md"))),
+              (1, "failed", True, False, [], False))
+
+        # A note that fails to publish after its record leaves no record
+        # naming a missing note or a late occupant; a rerun writes both.
+        real_publish = publish_new
+        withdrawn, runs = [], {}
+        for label in ("disk-full", "late-occupant"):
+            root, old, draft_path = note_vault("publish-note-" + label)
+            snap = record(root, "Articles/Old_Note_2025.md",
+                          "Articles/New_Note_2026.md")
+            runs[label] = (root, snap, draft_path,
+                           "Old_Note_2025", "New_Note_2026")
+
+            def fail_note(staged, target, *args, _label=label, **kwargs):
+                if os.path.basename(target) == "New_Note_2026.md":
+                    if _label == "disk-full":
+                        raise OSError(errno.ENOSPC, "injected disk-full note")
+                    touch(target, b"---\nsources:\n  - https://example.com/x\n"
+                                  b"---\n")
+                return real_publish(staged, target, *args, **kwargs)
+
+            with patch.dict(globals(), publish_new=fail_note):
+                code, out = publish_note_cli(*runs[label])
+            withdrawn.append((code, out["action"],
+                              "record was withdrawn" in out["detail"],
+                              sorted(os.listdir(os.path.join(root, "Articles")))))
+        code, out = publish_note_cli(*runs["disk-full"])
+        withdrawn.append((code, out["action"]))
+        check("a note that fails to publish withdraws this run's handoff "
+              "record, and a rerun publishes both",
+              withdrawn,
+              [(1, "failed", True, ["Old_Note_2025.md"]),
+               (1, "failed", True, ["New_Note_2026.md", "Old_Note_2025.md"]),
+               (0, "created")])
+
+        root, old, draft_path = note_vault("publish-note-occupied")
+        snap = record(root, "Articles/Old_Note_2025.md",
+                      "Articles/New_Note_2026.md")
+        late = touch(os.path.join(root, "Articles", "New_Note_2026.md"),
+                     b"---\nsources:\n  - https://example.com/other\n---\n")
+        code, out = publish_note_cli(root, snap, draft_path, "Old_Note_2025",
+                                     "New_Note_2026")
+        check("publish-note refuses a destination occupied after its absent "
+              "record and leaves the occupant",
+              (code, out["ok"], read_bytes(late)[:3], residue(root)),
+              (1, False, b"---", []))
+        foreign = os.path.join(root, "Articles", "Different_Origin_2026.md")
+        snap = record(root, "Articles/Old_Note_2025.md",
+                      "Articles/Different_Origin_2026.md")
+        with open(draft_path, "w", encoding="utf-8") as fh:
+            fh.write('---\nsources:\n  - "https://example.com/other"\n---\n')
+        code, out = publish_note_cli(root, snap, draft_path, "Old_Note_2025",
+                                     "Different_Origin_2026")
+        check("publish-note refuses a draft with another web origin",
+              (code, "web origin" in out.get("error", ""),
+               os.path.lexists(foreign)), (1, True, False))
+
+        root, old, draft_path = note_vault("publish-note-alias")
+        other = touch(os.path.join(root, "Articles", "Other_Note_2026.md"),
+                      b"---\nsources:\n  - https://example.com/other\n---\n")
+        snap = record(root, "Articles/Old_Note_2025.md")
+        code, out = publish_note_cli(root, snap, draft_path, "Old_Note_2025",
+                                     "other_note_2026")
+        check("publish-note refuses a case alias of another note's name",
+              (code, out["ok"], read_bytes(other)[:3],
+               sorted(os.listdir(os.path.join(root, "Articles")))),
+              (1, False, b"---",
+               ["Old_Note_2025.md", "Other_Note_2026.md"]))
+
+        # A case or Unicode respelling is not a changed slug: the note keeps
+        # its spelling, so publish-note refuses it on every volume type.
+        root, old, draft_path = note_vault("publish-note-respell")
+        snap = record(root, "Articles/Old_Note_2025.md")
+        old_bytes = read_bytes(old)
+        code, out = publish_note_cli(root, snap, draft_path, "Old_Note_2025",
+                                     "old_note_2025")
+        check("publish-note refuses a case-only respelling and changes nothing",
+              (code, out["ok"], "same-name rewrite" in out.get("error", ""),
+               sorted(os.listdir(os.path.join(root, "Articles"))),
+               read_bytes(old) == old_bytes, residue(root)),
+              (1, False, True, ["Old_Note_2025.md"], True, []))
+
+        root, old, draft_path = note_vault(
+            "publish-note-extract",
+            marker="<!-- obsidian:wiki-add-research-source -->\n")
+        snap = record(root, "Articles/Old_Note_2025.md",
+                      "Articles/New_Note_2026.md")
+        code, out = publish_note_cli(root, snap, draft_path, "Old_Note_2025",
+                                     "New_Note_2026")
+        check("publish-note never renames a legacy research extract",
+              (code, "research extract" in out.get("error", ""),
+               os.path.lexists(os.path.join(root, "Articles",
+                                            "New_Note_2026.md"))),
+              (1, True, False))
+        code, out = publish_note_cli(root, snap, draft_path, "Old_Note_2025",
+                                     "Old_Note_2025")
+        check("publish-note sends a same-spelling rewrite to publish_files.py",
+              (code, "publish_files.py" in out.get("error", "")), (1, True))
+
+        # A changed slug keeps the old note as the image phases' owner, and
+        # they accept only a current sources: list.
+        legacy_text = ('---\nsource: "https://example.com/article"\n---\n'
+                       'Old body.\n')
+        current_text = ('---\nsources:\n  - "https://example.com/article"\n'
+                        '---\nOld body.\n')
+        root, old, draft_path = note_vault("publish-note-legacy")
+        with open(old, "w", encoding="utf-8") as fh:
+            fh.write(legacy_text)
+        snap = record(root, "Articles/Old_Note_2025.md",
+                      "Articles/New_Note_2026.md")
+        new = os.path.join(root, "Articles", "New_Note_2026.md")
+        outcomes = []
+        for extra in (("--dry-run",), ()):
+            code, out = publish_note_cli(root, snap, draft_path,
+                                         "Old_Note_2025", "New_Note_2026",
+                                         *extra)
+            outcomes.append((code, "legacy scalar source:" in out.get(
+                "error", ""), "snapshot --replace" in out.get("error", "")))
+        check("publish-note refuses a changed slug whose old note has only a "
+              "legacy source: and names the migration",
+              (outcomes, os.path.lexists(new), read_bytes(old),
+               residue(root)),
+              ([(1, True, True)] * 2, False, legacy_text.encode(), []))
+        with open(old, "w", encoding="utf-8") as fh:
+            fh.write(current_text)
+        publish_files.cmd_snapshot(root, ["Articles/Old_Note_2025.md"],
+                                   output=snap, replace=True)
+        code, out = publish_note_cli(root, snap, draft_path, "Old_Note_2025",
+                                     "New_Note_2026")
+        check("...and publishes once the old note is migrated and re-recorded",
+              (code, out["action"]), (0, "created"))
+        nfc = unicodedata.normalize("NFC", "Müller_Note_2025")
+        nfd = unicodedata.normalize("NFD", nfc)
+        root, old, draft_path = note_vault("publish-note-nfd", old_slug=nfc)
+        snap = record(root, "Articles/%s.md" % nfc)
+        old_bytes = read_bytes(old)
+        outcomes = []
+        for extra in (("--dry-run",), ()):
+            code, out = publish_note_cli(root, snap, draft_path, nfc, nfd,
+                                         *extra)
+            outcomes.append((code, "Unicode normalization" in out.get(
+                "error", "")))
+        check("...and a Unicode-only respelling, with or without --dry-run",
+              (outcomes, [unicodedata.normalize("NFC", name) for name in
+                          os.listdir(os.path.join(root, "Articles"))],
+               read_bytes(old) == old_bytes, residue(root)),
+              ([(1, True)] * 2, [nfc + ".md"], True, []))
+
+        # Prepare runs only once the new note is public, so publish-note
+        # refuses its old-note image blockers while nothing is published.
+        for label, embeds, files, blocker, reason in (
+                ("stray", ("_fig_1.png",), ("_fig_1.png", "_fig_2.png"),
+                 "_fig_2.png", "ownership is unproven"),
+                ("missing", ("_fig_1.png", "_fig_3.png"), ("_fig_1.png",),
+                 "_fig_3.png", "exact attachment is missing")):
+            root, old, draft_path = note_vault("publish-note-image-" + label)
+            images = os.path.join(root, "Sources", "Images")
+            os.makedirs(images)
+            for tail in files:
+                touch(os.path.join(images, "Old_Note_2025" + tail), _PNG)
+            with open(old, "a", encoding="utf-8") as fh:
+                fh.write("".join("![[Old_Note_2025%s]]\n" % tail
+                                 for tail in embeds))
+            snap = record(root, "Articles/Old_Note_2025.md",
+                          "Articles/New_Note_2026.md")
+            new = os.path.join(root, "Articles", "New_Note_2026.md")
+            before = (read_bytes(old), sorted(os.listdir(images)))
+            outcomes = []
+            for extra in (("--dry-run",), ()):
+                code, out = publish_note_cli(root, snap, draft_path,
+                                             "Old_Note_2025", "New_Note_2026",
+                                             *extra)
+                error = out.get("error", "")
+                outcomes.append((code, "Old_Note_2025%s (" % blocker in error
+                                 and reason in error,
+                                 "nothing was published" in error))
+            check("publish-note refuses an old note's %s image before "
+                  "publication" % label,
+                  (outcomes, os.path.lexists(new),
+                   (read_bytes(old), sorted(os.listdir(images))) == before,
+                   residue(root)),
+                  ([(1, True, True)] * 2, False, True, []))
+        # The user removes the stray file; the clean plan then publishes, and
+        # the new note recorded at once can be withdrawn against that record.
+        root = os.path.join(tmp, "publish-note-image-stray")
+        os.remove(os.path.join(root, "Sources", "Images",
+                               "Old_Note_2025_fig_2.png"))
+        snap = os.path.join(tmp, "publish-note-image-stray-snap.json")
+        old = os.path.join(root, "Articles", "Old_Note_2025.md")
+        old_bytes = read_bytes(old)
+        code, out = publish_note_cli(root, snap,
+                                     os.path.join(tmp, "publish-note-image-"
+                                                  "stray-draft.md"),
+                                     "Old_Note_2025", "New_Note_2026")
+        new = os.path.join(root, "Articles", "New_Note_2026.md")
+        unrecorded, _code = publish_files.cmd_remove(
+            root, snap, ["Articles/New_Note_2026.md"])
+        recorded, _code = publish_files.cmd_snapshot(
+            root, ["Articles/New_Note_2026.md"], output=snap, replace=True)
+        withdrawn, _code = publish_files.cmd_remove(
+            root, snap, ["Articles/New_Note_2026.md"])
+        check("...a clean image plan publishes, and only the new note "
+              "recorded at once is withdrawn against its record",
+              (code, out["action"],
+               [row["action"] for row in unrecorded["results"]],
+               recorded["snapshots"][0]["digest"] == out["sha256"],
+               [row["action"] for row in withdrawn["results"]],
+               os.path.lexists(new), read_bytes(old) == old_bytes),
+              (0, "created", ["refused"], True, ["removed"], False, True))
+
+        usage = io.StringIO()
+        try:
+            with contextlib.redirect_stderr(usage):
+                main(["rename", "--phase", "publish-note",
+                      "--owner-note", old, "--new-owner-note", old,
+                      "--old-slug", "Old_Note_2025",
+                      "--new-slug", "New_Note_2026"])
+            usage_exit = None
+        except SystemExit as exc:
+            usage_exit = exc.code
+        check("publish-note requires --vault, --snapshots and --draft",
+              (usage_exit, "--snapshots" in usage.getvalue()), (2, True))
+        usage = io.StringIO()
+        try:
+            with contextlib.redirect_stderr(usage):
+                main(["rename", "--phase", "prepare",
+                      "--owner-note", old, "--new-owner-note", old,
+                      "--old-slug", "Old_Note_2025",
+                      "--new-slug", "New_Note_2026"])
+            usage_exit = None
+        except SystemExit as exc:
+            usage_exit = exc.code
+        check("the image phases still require --attachments and --sources",
+              (usage_exit, "--attachments" in usage.getvalue()), (2, True))
+    finally:
+        tempfile.tempdir = previous_tempdir
+        shutil.rmtree(tmp, ignore_errors=True)
+
+    failed = [c for c in cases if not c[1]]
+    for label, ok, got, want in cases:
+        if not ok:
+            print("FAIL  %s\n        got  %r\n        want %r"
+                  % (label, got, want))
+    print("%d/%d self-test cases pass" % (len(cases) - len(failed), len(cases)))
+    return 1 if failed else 0
+
+
+def _read_urls_file(path):
+    """Read a URL list completely as strict UTF-8 and close owned handles."""
+    if path == "-":
+        binary = getattr(sys.stdin, "buffer", None)
+        if binary is not None:
+            text = binary.read().decode("utf-8-sig", "strict")
+        else:  # StringIO and other programmatic callers are already Unicode.
+            text = sys.stdin.read().lstrip("\ufeff")
+        return [line.strip() for line in text.splitlines() if line.strip()]
+    with open(path, "r", encoding="utf-8-sig", errors="strict") as stream:
+        return [line.strip() for line in stream if line.strip()]
+
+
+def main(argv=None):
+    reconfigure = getattr(sys.stdout, "reconfigure", None)
+    if callable(reconfigure):
+        try:
+            reconfigure(encoding="utf-8", errors="backslashreplace")
+        except (OSError, ValueError):
+            pass
+    ap = argparse.ArgumentParser(
+        description=__doc__.split("\n")[0],
+        epilog="Network policy: direct connections only; ambient HTTP(S) proxy "
+               "settings are not used because proxy-side DNS would defeat "
+               "address pinning.")
+    sub = ap.add_subparsers(dest="cmd", required=True)
+
+    s = sub.add_parser("stage", help="download validated images to scratch "
+                       "outside the vault before the note is published")
+    s.add_argument("urls", nargs="*")
+    s.add_argument("--out-dir", required=True,
+                   help="unique empty scratch directory outside --vault")
+    s.add_argument("--vault", required=True,
+                   help="vault root used to enforce the scratch boundary")
+    s.add_argument("--slug", required=True)
+    s.add_argument("--start", type=_positive_index_arg, default=1)
+    s.add_argument("--urls-file", help="UTF-8 file with one URL per line; - for stdin")
+    s.add_argument("--timeout", type=_positive_int_arg, default=45,
+                   help="per-socket-operation timeout, seconds (default 45)")
+    s.add_argument("--max-bytes", type=_positive_int_arg, default=DEFAULT_MAX_BYTES,
+                   help=f"per-image size cap (default {DEFAULT_MAX_BYTES})")
+    s.add_argument("--max-seconds", type=_positive_int_arg, default=DEFAULT_MAX_SECONDS,
+                   help="wall-clock budget for one image, across the whole "
+                        f"transfer (default {DEFAULT_MAX_SECONDS})")
+    s.add_argument("--allow-private-hosts", action="store_true",
+                   help="permit hosts resolving to loopback/link-local/private "
+                        "addresses (off by default; does not enable proxies)")
+
+    f = sub.add_parser("fetch", help="download a validated Lottie JSON/dotLottie "
+                       "source; the default is a system temp path")
+    f.add_argument("url")
+    f.add_argument("--out", help="scratch path outside the vault (default: a "
+                   "system temp file); requires --vault; an existing path is "
+                   "refused unless --overwrite")
+    f.add_argument("--vault", help="vault root used to prove an explicit "
+                   "--out is outside the vault")
+    f.add_argument("--timeout", type=_positive_int_arg, default=45,
+                   help="per-socket-operation timeout, seconds (default 45)")
+    f.add_argument("--max-bytes", type=_positive_int_arg, default=DEFAULT_MAX_BYTES,
+                   help=f"size cap (default {DEFAULT_MAX_BYTES})")
+    f.add_argument("--max-seconds", type=_positive_int_arg, default=DEFAULT_MAX_SECONDS,
+                   help="wall-clock budget across the whole transfer "
+                        f"(default {DEFAULT_MAX_SECONDS})")
+    f.add_argument("--allow-private-hosts", action="store_true",
+                   help="permit hosts resolving to loopback/link-local/private "
+                        "addresses (off by default; does not enable proxies)")
+    f.add_argument("--overwrite", action="store_true")
+
+    p = sub.add_parser("place", help="move a locally rendered image into "
+                       "Sources/Images/ under this script's write guards")
+    p.add_argument("--attachments", required=True)
+    p.add_argument("--slug", required=True)
+    p.add_argument("--index", type=_positive_index_arg, required=True)
+    p.add_argument("--from-file", required=True, dest="from_file",
+                   help="the rendered file, which must live OUTSIDE the "
+                        "attachments folder; it is moved, not copied, and its "
+                        "extension comes from its bytes, not from its name")
+    p.add_argument("--overwrite", action="store_true",
+                   help="guarded low-level capability that no clipping-clean "
+                        "workflow uses (existing attachments are never "
+                        "replaced): replaces an existing figure only at the "
+                        "same filename; a format change needs a fresh index "
+                        "(off by default)")
+    p.add_argument("--owner-note", required=True,
+                   help="published Articles/<slug>.md whose rendered embed "
+                        "exactly names the attachment")
+
+    r = sub.add_parser(
+        "rename", help="publish a changed-slug note, or prepare, repair or "
+        "finalize an attachment handoff after a slug change")
+    r.add_argument("--attachments",
+                   help="the vault's Sources/Images folder; required by "
+                        "prepare, repair and finalize")
+    r.add_argument("--sources",
+                   help="the vault's Sources/PDFs folder, required by "
+                   "prepare, repair and finalize; "
+                   "a <slug>.pdf there proves the figures are a "
+                   "PDF's and the rename is refused")
+    r.add_argument("--old-slug", required=True)
+    r.add_argument("--new-slug", required=True)
+    r.add_argument("--owner-note", required=True,
+                   help="the unchanged Articles/<old-slug>.md; every renamed "
+                        "attachment must be an exact rendered filename-only "
+                        "embed. The same path as --new-owner-note selects a "
+                        "same-note re-stem. For publish-note, the old note "
+                        "recorded in --snapshots")
+    r.add_argument("--new-owner-note", required=True,
+                   help="published Articles/<new-slug>.md with the same web "
+                        "origin and exact mapped new embeds; required for "
+                        "every phase. In a same-note re-stem it is the "
+                        "--owner-note path, which embeds the old names at "
+                        "prepare and the mapped new names only at finalize. "
+                        "For publish-note, the destination recorded absent")
+    r.add_argument("--phase",
+                   choices=("publish-note", "prepare", "repair", "finalize"),
+                   required=True,
+                   help="required: publish-note publishes the reviewed draft "
+                        "as the new note against the old note's snapshot "
+                        "record, after the old note's image plan passes; "
+                        "prepare publishes new-name copies while "
+                        "retaining old names; repair points other notes' "
+                        "references at the new names; finalize retires exact "
+                        "old copies after dependencies are clear")
+    r.add_argument("--vault",
+                   help="publish-note only: the vault root the snapshot file "
+                        "records")
+    r.add_argument("--snapshots",
+                   help="publish-note only: the run's publish_files.py "
+                        "snapshot file holding the old note's record (and "
+                        "the new path's absent record for a changed slug)")
+    r.add_argument("--draft",
+                   help="publish-note only: the reviewed scratch draft, an "
+                        "absolute path outside the vault")
+    r.add_argument("--dry-run", action="store_true")
+
+    q = sub.add_parser(
+        "dependencies", help="re-probe external Markdown links and embeds before "
+        "retiring an old clipping note or attachment stem")
+    q.add_argument("--attachments", required=True)
+    q.add_argument("--old-slug", required=True)
+    q.add_argument("--owner-note", required=True,
+                   help="the unchanged Articles/<old-slug>.md whose old image "
+                        "embeds define the dependency inventory, or with "
+                        "--new-slug the re-stemmed Articles/<new-slug>.md")
+    q.add_argument("--new-slug",
+                   help="same-note re-stem: only the old-stem image names "
+                        "are dependencies")
+
+    o = sub.add_parser(
+        "preflight", help="check whether a proposed clipping slug already has "
+                          "a PDF or image-prefix owner")
+    o.add_argument("--vault", required=True)
+    o.add_argument("--slug", required=True)
+
+    sub.add_parser("selftest", help="run the built-in cases (offline)")
+
+    args = ap.parse_args(argv)
+
+    if args.cmd == "selftest":
+        return run_self_test()
+
+    if args.cmd == "preflight":
+        try:
+            report = slug_occupancy(args.vault, args.slug)
+        except (OSError, UnicodeError, ValueError) as exc:
+            report = {"ok": False, "vault": args.vault, "slug": args.slug,
+                      "error": str(exc), "pdf_stem_occupied": None,
+                      "image_occupants": []}
+        print(json.dumps(dict(report, mode="preflight"), indent=2,
+                         ensure_ascii=False))
+        return 0 if report["ok"] else 1
+
+    if args.cmd == "dependencies":
+        try:
+            report = dependency_status(args.attachments, args.owner_note,
+                                       args.old_slug, new_slug=args.new_slug)
+        except (OSError, UnicodeError, ValueError) as exc:
+            report = {"ok": False, "old_slug": args.old_slug,
+                      "error": str(exc), "blockers": []}
+        print(json.dumps(dict(report, mode="dependencies"), indent=2,
+                         ensure_ascii=False))
+        return 0 if report["ok"] else 1
+
+    if args.cmd == "stage":
+        urls = list(args.urls)
+        if args.urls_file:
+            try:
+                urls += _read_urls_file(args.urls_file)
+            except (OSError, UnicodeError) as exc:
+                print(json.dumps({"mode": "stage", "slug": args.slug,
+                                  "error": "cannot read --urls-file as complete "
+                                           "UTF-8: %s" % exc,
+                                  "results": [], "downloaded": 0,
+                                  "failed": len(urls) or 1},
+                                 indent=2, ensure_ascii=False))
+                return 1
+        if not urls:
+            ap.error("no URLs given")
+        try:
+            validate_slug(args.slug)      # once, loudly, not N identical failures
+        except ValueError as exc:
+            print(json.dumps({"mode": "stage", "slug": args.slug,
+                              "error": str(exc), "results": [], "downloaded": 0,
+                              "failed": len(urls)}, indent=2, ensure_ascii=False))
+            return 1
+        staging = args.out_dir
+        if not os.path.isdir(args.vault):
+            print(json.dumps({"mode": "stage", "slug": args.slug,
+                              "error": "--vault is not a directory: %r" % args.vault,
+                              "results": [], "downloaded": 0,
+                              "failed": len(urls)}, indent=2,
+                             ensure_ascii=False))
+            return 1
+        try:
+            if _at_or_inside_existing_directory(staging, args.vault):
+                raise ValueError("--out-dir must be outside --vault")
+            if os.path.lexists(staging) and (
+                    not os.path.isdir(staging)
+                    or os.listdir(staging)):
+                raise ValueError("--out-dir must be a new or empty unique "
+                                 "scratch directory")
+        except (OSError, ValueError) as exc:
+            print(json.dumps({"mode": "stage", "slug": args.slug,
+                              "error": str(exc), "results": [],
+                              "downloaded": 0, "failed": len(urls)},
+                             indent=2, ensure_ascii=False))
+            return 1
+        results = []
+        for i, url in enumerate(urls, start=args.start):
+            results.append(download_one(
+                url, staging, args.slug, i, timeout=args.timeout,
+                max_bytes=args.max_bytes, max_seconds=args.max_seconds,
+                allow_private=args.allow_private_hosts))
+        failed = [x for x in results if not x["ok"]]
+        out = {"mode": "stage", "slug": args.slug, "staging_dir": staging,
+               "results": results,
+               "downloaded": len(results) - len(failed), "failed": len(failed),
+               "next_index": args.start + len(results)}
+        print(json.dumps(out, indent=2, ensure_ascii=False))
+        return 1 if failed else 0
+
+    if args.cmd == "fetch":
+        res = fetch_source(args.url, args.out, timeout=args.timeout,
+                           max_bytes=args.max_bytes,
+                           max_seconds=args.max_seconds,
+                           allow_private=args.allow_private_hosts,
+                           overwrite=args.overwrite, vault=args.vault)
+        print(json.dumps(dict(res, mode="fetch"), indent=2,
+                         ensure_ascii=False))
+        return 0 if res["ok"] else 1
+
+    if args.cmd == "place":
+        res = place_file(args.from_file, args.attachments, args.slug,
+                         args.index, overwrite=args.overwrite,
+                         owner_note=args.owner_note, require_vault=True)
+        print(json.dumps(dict(res, mode="place", slug=args.slug,
+                              attachments=args.attachments), indent=2,
+                         ensure_ascii=False))
+        return 0 if res["ok"] else 1
+
+    if args.phase == "publish-note":
+        missing = [flag for flag, value in (
+            ("--vault", args.vault), ("--snapshots", args.snapshots),
+            ("--draft", args.draft)) if not value]
+        if missing:
+            r.error("rename --phase publish-note requires %s"
+                    % ", ".join(missing))
+    elif not args.attachments or not args.sources:
+        r.error("rename --phase %s requires --attachments and --sources"
+                % args.phase)
+    try:
+        if args.phase == "publish-note":
+            report = publish_clipping_note(
+                args.vault, args.snapshots, args.draft, args.old_slug,
+                args.new_slug, owner_note=args.owner_note,
+                new_owner_note=args.new_owner_note, dry_run=args.dry_run)
+            print(json.dumps(dict(report, mode="rename"), indent=2,
+                             ensure_ascii=False))
+            return 0 if report["ok"] else 1
+        if args.phase == "prepare":
+            report = prepare_slug_rename(
+                args.attachments, args.old_slug, args.new_slug,
+                sources=args.sources, owner_note=args.owner_note,
+                new_owner_note=args.new_owner_note, dry_run=args.dry_run)
+            print(json.dumps(dict(report, mode="rename"), indent=2,
+                             ensure_ascii=False))
+            return 0 if report["ok"] else 1
+        if args.phase == "repair":
+            report = repair_slug_rename(
+                args.attachments, args.old_slug, args.new_slug,
+                sources=args.sources, owner_note=args.owner_note,
+                new_owner_note=args.new_owner_note, dry_run=args.dry_run)
+            print(json.dumps(dict(report, mode="rename"), indent=2,
+                             ensure_ascii=False))
+            return 0 if report["ok"] else 1
+        if args.phase == "finalize":
+            report = finalize_slug_rename(
+                args.attachments, args.old_slug, args.new_slug,
+                sources=args.sources, owner_note=args.owner_note,
+                new_owner_note=args.new_owner_note, dry_run=args.dry_run)
+            print(json.dumps(dict(report, mode="rename"), indent=2,
+                             ensure_ascii=False))
+            return 0 if report["ok"] else 1
+    except (OSError, UnicodeError, ValueError) as exc:
+        print(json.dumps({"mode": "rename", "phase": args.phase,
+                          "ok": False, "old_slug": args.old_slug,
+                          "new_slug": args.new_slug, "error": str(exc),
+                          "results": []},
+                         indent=2, ensure_ascii=False))
+        return 1
+
+
+if __name__ == "__main__":
+    sys.exit(main())
